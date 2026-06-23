@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Network Device Mapper</title>
+
+<!-- vis-network: zero-build force-directed graph, loaded from CDN -->
+<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+
+<style>
+  :root {
+    --bg: #0f172a;          /* slate-900 */
+    --panel: #1e293b;       /* slate-800 */
+    --panel-2: #273449;
+    --text: #e2e8f0;        /* slate-200 */
+    --muted: #94a3b8;       /* slate-400 */
+    --accent: #38bdf8;      /* sky-400  */
+    --gateway: #f59e0b;     /* amber-500 */
+    --self: #34d399;        /* emerald-400 */
+    --border: #334155;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  header .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  button {
+    background: var(--accent); color: #082f49; border: 0; border-radius: 8px;
+    padding: 9px 16px; font-weight: 600; cursor: pointer; font-size: 14px;
+    transition: opacity .15s;
+  }
+  button:hover { opacity: .9; }
+  button:disabled { opacity: .5; cursor: progress; }
+
+  .layout { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; padding: 16px 24px; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; overflow: hidden;
+  }
+  .card h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 0; padding: 14px 16px; border-bottom: 1px solid var(--border);
+  }
+  /* Fill most of the viewport so the graph is large and readable. */
+  #topology { height: calc(100vh - 200px); min-height: 560px; background: radial-gradient(circle at 50% 40%, #16233b, var(--bg)); }
+
+  /* Keep the device list compact; scroll internally instead of growing tall. */
+  #tableWrap { max-height: calc(100vh - 150px); overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+  th, td { text-align: left; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
+  tr:hover td { background: var(--panel-2); }
+  td.ip { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); }
+  td.mac { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); font-size: 12px; }
+  .badge {
+    display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 6px;
+    border-radius: 5px; margin-left: 6px; vertical-align: middle;
+  }
+  .badge.gw { background: var(--gateway); color: #422006; }
+  .badge.self { background: var(--self); color: #064e3b; }
+
+  .legend { display: flex; gap: 16px; padding: 6px 16px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
+  .legend span::before { content: "●"; margin-right: 5px; }
+  .dot-gw::before { color: var(--gateway); }
+  .dot-self::before { color: var(--self); }
+  .dot-dev::before { color: var(--accent); }
+
+  .status { padding: 24px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Network Device Mapper</h1>
+      <div class="meta" id="meta">Ready to scan.</div>
+    </div>
+    <button id="scanBtn">Scan network</button>
+  </header>
+
+  <div class="layout">
+    <div class="card">
+      <h2>Topology</h2>
+      <div id="topology"></div>
+      <div class="legend">
+        <span class="dot-gw">Gateway / Router</span>
+        <span class="dot-self">This device</span>
+        <span class="dot-dev">Discovered device</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Devices</h2>
+      <div id="tableWrap">
+        <div class="status">Click “Scan network” to discover devices.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // Point this at your scanner API if the widget is hosted elsewhere.
+  const API_BASE = "";
+
+  const scanBtn = document.getElementById("scanBtn");
+  const meta = document.getElementById("meta");
+  const tableWrap = document.getElementById("tableWrap");
+  let network = null;
+
+  scanBtn.addEventListener("click", runScan);
+
+  async function runScan() {
+    scanBtn.disabled = true;
+    scanBtn.textContent = "Scanning…";
+    meta.textContent = "Sweeping the subnet — this can take a few seconds.";
+    tableWrap.innerHTML = '<div class="status">Scanning…</div>';
+    try {
+      const res = await fetch(`${API_BASE}/api/scan?force=true`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      render(data);
+    } catch (err) {
+      meta.textContent = "Scan failed.";
+      tableWrap.innerHTML = `<div class="status">Error: ${err.message}</div>`;
+    } finally {
+      scanBtn.disabled = false;
+      scanBtn.textContent = "Rescan";
+    }
+  }
+
+  function render(data) {
+    const devices = data.devices || [];
+    meta.textContent =
+      `${devices.length} devices on ${data.network_cidr || "?"} · gateway ${data.gateway_ip || "unknown"}`;
+    renderTable(devices);
+    renderTopology(data);
+  }
+
+  function renderTable(devices) {
+    if (!devices.length) {
+      tableWrap.innerHTML = '<div class="status">No devices found.</div>';
+      return;
+    }
+    const rows = devices.map((d) => {
+      const badges =
+        (d.is_gateway ? '<span class="badge gw">GATEWAY</span>' : "") +
+        (d.is_self ? '<span class="badge self">THIS PC</span>' : "");
+      return `<tr>
+        <td>${escapeHtml(d.label)}${badges}</td>
+        <td class="ip">${escapeHtml(d.ip)}</td>
+        <td class="mac">${escapeHtml(d.mac || "—")}</td>
+        <td>${escapeHtml(d.vendor || "—")}</td>
+      </tr>`;
+    }).join("");
+    tableWrap.innerHTML = `<table>
+      <thead><tr><th>Device</th><th>IP address</th><th>MAC</th><th>Vendor</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+
+  function renderTopology(data) {
+    const devices = data.devices || [];
+    const gatewayIp = data.gateway_ip;
+    const nodes = [];
+    const edges = [];
+
+    // Synthesize a gateway node even if it didn't answer, so spokes have a hub.
+    const haveGateway = devices.some((d) => d.is_gateway);
+    if (gatewayIp && !haveGateway) {
+      nodes.push(gatewayNode({ ip: gatewayIp, label: "Gateway" }));
+    }
+
+    for (const d of devices) {
+      nodes.push(nodeFor(d));
+      const hub = gatewayIp || (devices[0] && devices[0].ip);
+      if (hub && d.ip !== hub) {
+        edges.push({ from: hub, to: d.ip, color: { color: "#334155" }, width: 1 });
+      }
+    }
+
+    const container = document.getElementById("topology");
+    const opts = {
+      nodes: { shape: "dot", size: 16, font: { color: "#e2e8f0", size: 13 }, borderWidth: 2 },
+      edges: { smooth: { type: "continuous" } },
+      physics: { stabilization: true, barnesHut: { gravitationalConstant: -8000, springLength: 130 } },
+      interaction: { hover: true, tooltipDelay: 120 },
+    };
+    if (network) network.destroy();
+    network = new vis.Network(container, { nodes, edges }, opts);
+  }
+
+  function nodeFor(d) {
+    if (d.is_gateway) return gatewayNode(d);
+    const color = d.is_self ? "#34d399" : "#38bdf8";
+    return {
+      id: d.ip, label: d.label, value: d.is_self ? 3 : 2,
+      color: { background: color, border: "#0f172a" },
+      title: tooltip(d),
+    };
+  }
+
+  function gatewayNode(d) {
+    return {
+      id: d.ip, label: d.label || "Gateway", shape: "diamond", size: 26,
+      color: { background: "#f59e0b", border: "#0f172a" },
+      title: tooltip(d),
+    };
+  }
+
+  function tooltip(d) {
+    return [d.label, d.ip, d.mac, d.vendor].filter(Boolean).join("\n");
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+</script>
+</body>
+</html>

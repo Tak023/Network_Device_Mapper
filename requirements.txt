@@ -1,0 +1,4 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# Optional: human-readable MAC vendor names. Discovery degrades gracefully without it.
+mac-vendor-lookup>=0.1.12
