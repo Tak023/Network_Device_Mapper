@@ -18,4 +18,5 @@ pip install --quiet --upgrade pip
 pip install --quiet -r requirements.txt
 
 echo "→ Starting on http://127.0.0.1:${PORT}  (Ctrl-C to stop)"
-exec uvicorn backend.server:app --host 0.0.0.0 --port "$PORT"
+# --reload picks up code edits without a manual restart.
+exec uvicorn backend.server:app --host 0.0.0.0 --port "$PORT" --reload

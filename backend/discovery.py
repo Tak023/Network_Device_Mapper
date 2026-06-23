@@ -31,6 +31,10 @@ logger = logging.getLogger("discovery")
 PING_TIMEOUT_S = 1.0
 MAX_WORKERS = 128
 
+# Upper bound on hosts per scan. Guards against someone sweeping a /8 (16M hosts),
+# which would hang for hours. 4096 == a /20, comfortably covers any home/SMB subnet.
+MAX_SCAN_HOSTS = 4096
+
 _MAC_RE = re.compile(r"(([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2})")
 
 
@@ -59,6 +63,8 @@ class ScanResult:
     self_ip: Optional[str]
     network_cidr: Optional[str]
     devices: list[Device] = field(default_factory=list)
+    reachable: bool = True          # False == no route / network appears unreachable
+    note: Optional[str] = None      # human-readable status for the UI
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -298,37 +304,105 @@ def _vendor_lookup_factory():
 # Public API
 # --------------------------------------------------------------------------- #
 
-def scan() -> ScanResult:
-    """Discover devices on the primary local subnet."""
-    self_ip, gateway, network = _local_network()
+def parse_target(spec: str) -> tuple[list[str], Optional[ipaddress.IPv4Network]]:
+    """Parse a user-supplied target into (host_ips, network).
+
+    Accepts:
+      * CIDR            -> "192.168.1.0/24"
+      * single IP       -> "10.0.0.5"
+      * explicit range  -> "192.168.1.10-192.168.1.50"
+      * shorthand range -> "192.168.1.10-50"  (end inherits the start's /24 prefix)
+
+    Raises ValueError on malformed input or a range exceeding MAX_SCAN_HOSTS.
+    """
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("Empty target.")
+
+    # Dash range (not a CIDR).
+    if "-" in spec and "/" not in spec:
+        start_s, end_s = (p.strip() for p in spec.split("-", 1))
+        start = ipaddress.ip_address(start_s)
+        if "." not in end_s and ":" not in end_s:  # shorthand: reuse start's prefix
+            end_s = f"{start_s.rsplit('.', 1)[0]}.{end_s}"
+        end = ipaddress.ip_address(end_s)
+        if int(end) < int(start):
+            raise ValueError("Range end is before its start.")
+        count = int(end) - int(start) + 1
+        if count > MAX_SCAN_HOSTS:
+            raise ValueError(f"Range too large ({count} hosts); max is {MAX_SCAN_HOSTS}.")
+        hosts = [str(ipaddress.ip_address(i)) for i in range(int(start), int(end) + 1)]
+        return hosts, None
+
+    # CIDR or single address.
+    net = ipaddress.ip_network(spec, strict=False)
+    if net.num_addresses > MAX_SCAN_HOSTS:
+        raise ValueError(
+            f"Network too large ({net.num_addresses} hosts); max is {MAX_SCAN_HOSTS}."
+        )
+    if net.prefixlen >= 31:  # /31, /32 carry no usable host range
+        return [str(net.network_address)], net
+    return [str(h) for h in net.hosts()], net
+
+
+def _is_on_link(network: Optional[ipaddress.IPv4Network]) -> bool:
+    """True if `network` overlaps a directly-connected interface subnet (same L2).
+
+    A directly-connected target is reachable by definition; if it's *not* on-link and
+    nothing answers, we treat it as unreachable rather than "empty".
+    """
+    if network is None:
+        return False
+    for _ip, net in _enumerate_ipv4():
+        if net.prefixlen <= 30 and network.overlaps(net):
+            return True
+    return False
+
+
+def scan(target: Optional[str] = None) -> ScanResult:
+    """Discover devices on the local subnet, or on an explicit `target` range.
+
+    `target` accepts any form understood by :func:`parse_target`. When omitted,
+    the primary LAN is auto-detected.
+    """
+    self_ip = _primary_ip()
+
+    if target:
+        hosts, network = parse_target(target)  # may raise ValueError
+        gateway = None  # not our default route; inferred below if a .1 answers
+        host_set = set(hosts)
+    else:
+        self_ip, gateway, network = _local_network()
+        host_set = {str(h) for h in network.hosts()} if network else set()
+
     result = ScanResult(
         gateway_ip=gateway,
         self_ip=self_ip,
-        network_cidr=str(network) if network else None,
+        network_cidr=str(network) if network else (target or None),
     )
-    if not network:
-        logger.warning("Could not determine local network; aborting scan.")
+    if not host_set:
+        logger.warning("No hosts to scan (target=%r); aborting.", target)
         return result
 
-    host_set = {str(h) for h in network.hosts()}
-    logger.info("Sweeping %d hosts on %s", len(host_set), network)
+    logger.info("Sweeping %d hosts (%s)", len(host_set), result.network_cidr)
     alive = _ping_sweep(sorted(host_set, key=lambda x: ipaddress.ip_address(x)))
 
     arp = _arp_table()
     # Union of ping replies and ARP entries: some devices answer ARP but drop ICMP.
     discovered_ips = (alive | set(arp)) & host_set
-    if self_ip:
+    if self_ip and self_ip in host_set:  # only when our own IP is within the target
         discovered_ips.add(self_ip)
 
-    # The default route may exit a different interface (VPN/overlay) than the LAN we
+    # The default route may exit a different interface (VPN/overlay) than the subnet we
     # scanned, leaving gateway unknown. Fall back to the conventional first host (.1)
-    # when it was actually discovered, so the topology has a real hub.
-    if (not gateway or gateway not in host_set) and discovered_ips:
+    # when it was actually discovered, so the topology has a real hub. Only meaningful
+    # for CIDR-shaped targets (a dash-range has no canonical network address).
+    if network and (not gateway or gateway not in host_set) and discovered_ips:
         first_host = str(next(network.hosts()))
         if first_host in discovered_ips:
             gateway = first_host
             result.gateway_ip = gateway
-            logger.info("Gateway not on default route; inferred LAN gateway %s", gateway)
+            logger.info("Gateway not on default route; inferred gateway %s", gateway)
 
     vendor_of = _vendor_lookup_factory()
     devices: list[Device] = []
@@ -345,14 +419,33 @@ def scan() -> ScanResult:
         devices.append(dev)
 
     result.devices = devices
-    logger.info("Discovered %d devices", len(devices))
+
+    # Distinguish "reachable but empty" from "unreachable". A directly-connected
+    # subnet (or the auto-detected local LAN) that returns nothing is simply empty;
+    # an off-link target that returns nothing has no route from this host.
+    if not devices:
+        on_link = (target is None) or _is_on_link(network)
+        if on_link:
+            result.note = f"No devices responded on {result.network_cidr}."
+        else:
+            result.reachable = False
+            result.note = (
+                f"{result.network_cidr} appears unreachable from this host "
+                f"(no route, or no devices responded)."
+            )
+
+    logger.info(
+        "Discovered %d devices (reachable=%s)", len(devices), result.reachable
+    )
     return result
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    res = scan()
-    print(f"\nNetwork: {res.network_cidr}  Gateway: {res.gateway_ip}\n")
+    target_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    res = scan(target_arg)
+    print(f"\nNetwork: {res.network_cidr}  Gateway: {res.gateway_ip}")
+    print(f"Reachable: {res.reachable}" + (f"  ({res.note})" if res.note else "") + "\n")
     for d in res.devices:
         tags = " ".join(t for t in ("gateway" if d.is_gateway else "",
                                     "self" if d.is_self else "") if t)

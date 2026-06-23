@@ -39,7 +39,9 @@ app.add_middleware(
 
 # Simple time-based cache guarded by a lock so concurrent requests don't trigger
 # overlapping sweeps.
-_cache: dict = {"ts": 0.0, "data": None}
+# Cache keyed by target ("" == auto-detected local LAN) so switching ranges doesn't
+# return a stale result for a different network.
+_cache: dict[str, dict] = {}
 _lock = threading.Lock()
 
 
@@ -49,20 +51,31 @@ def health() -> dict:
 
 
 @app.get("/api/scan")
-def api_scan(force: bool = False) -> JSONResponse:
+def api_scan(force: bool = False, target: str | None = None) -> JSONResponse:
+    key = (target or "").strip()
     now = time.monotonic()
     with _lock:
-        fresh = _cache["data"] is not None and (now - _cache["ts"]) < CACHE_TTL_S
-        if force or not fresh:
-            logger.info("Running network scan (force=%s)", force)
-            _cache["data"] = discovery.scan().to_dict()
-            _cache["ts"] = now
-        return JSONResponse(_cache["data"])
+        entry = _cache.get(key)
+        fresh = entry is not None and (now - entry["ts"]) < CACHE_TTL_S
+        if not force and fresh:
+            return JSONResponse(entry["data"])
+
+        logger.info("Running scan (target=%r, force=%s)", key or "local", force)
+        try:
+            data = discovery.scan(key or None).to_dict()
+        except ValueError as exc:  # invalid/oversized target from parse_target
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        _cache[key] = {"ts": now, "data": data}
+        # Never let the browser cache a scan result; our own TTL cache handles reuse.
+        return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "index.html")
+    # no-cache forces the browser to revalidate, so widget updates take effect on reload.
+    return FileResponse(
+        FRONTEND_DIR / "index.html", headers={"Cache-Control": "no-cache"}
+    )
 
 
 # Serve any other static assets (kept after routes so "/" resolves above).

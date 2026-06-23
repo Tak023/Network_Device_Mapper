@@ -40,6 +40,16 @@
   }
   button:hover { opacity: .9; }
   button:disabled { opacity: .5; cursor: progress; }
+  button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+
+  .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  #rangeInput {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 12px; font-size: 14px; width: 230px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #rangeInput::placeholder { color: var(--muted); font-family: -apple-system, sans-serif; }
+  #rangeInput:focus { outline: none; border-color: var(--accent); }
 
   .layout { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; padding: 16px 24px; }
   @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
@@ -78,6 +88,10 @@
   .dot-dev::before { color: var(--accent); }
 
   .status { padding: 24px; text-align: center; color: var(--muted); }
+  .topo-status {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; padding: 24px; text-align: center; color: var(--muted);
+  }
 </style>
 </head>
 <body>
@@ -86,7 +100,12 @@
       <h1>Network Device Mapper</h1>
       <div class="meta" id="meta">Ready to scan.</div>
     </div>
-    <button id="scanBtn">Scan network</button>
+    <div class="controls">
+      <input id="rangeInput" type="text" spellcheck="false"
+             placeholder="e.g. 192.168.1.0/24 or 10.0.0.1-50" />
+      <button id="rangeBtn" class="secondary">Scan range</button>
+      <button id="scanBtn">Scan my network</button>
+    </div>
   </header>
 
   <div class="layout">
@@ -113,35 +132,106 @@
   const API_BASE = "";
 
   const scanBtn = document.getElementById("scanBtn");
+  const rangeBtn = document.getElementById("rangeBtn");
+  const rangeInput = document.getElementById("rangeInput");
   const meta = document.getElementById("meta");
   const tableWrap = document.getElementById("tableWrap");
   let network = null;
 
-  scanBtn.addEventListener("click", runScan);
+  scanBtn.addEventListener("click", () => runScan(null));
+  rangeBtn.addEventListener("click", () => runScan(rangeInput.value.trim()));
+  rangeInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") runScan(rangeInput.value.trim());
+  });
 
-  async function runScan() {
-    scanBtn.disabled = true;
-    scanBtn.textContent = "Scanning…";
-    meta.textContent = "Sweeping the subnet — this can take a few seconds.";
-    tableWrap.innerHTML = '<div class="status">Scanning…</div>';
+  const topologyEl = document.getElementById("topology");
+  let centering = false; // reentrancy guard: moveTo/fit must not recurse via events
+
+  // Place the midpoint of all nodes at the viewport center. When keepScale is true we
+  // preserve the user's current zoom (used while zooming); otherwise we frame-to-fit.
+  function centerGraph(keepScale) {
+    if (!network || centering) return;
+    centering = true;
     try {
-      const res = await fetch(`${API_BASE}/api/scan?force=true`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const pts = Object.values(network.getPositions());
+      if (!pts.length) return;
+      const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+      const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+      const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+      if (keepScale) {
+        network.moveTo({ position: { x: cx, y: cy }, scale: network.getScale(), animation: false });
+      } else {
+        network.fit({ animation: false });
+      }
+    } finally {
+      centering = false;
+    }
+  }
+
+  // Re-center on ANY container size change (window resize, panel drag, layout reflow).
+  // A ResizeObserver on the container is far more reliable than window's resize event.
+  new ResizeObserver(() => {
+    if (!network) return;
+    network.setSize(topologyEl.clientWidth + "px", topologyEl.clientHeight + "px");
+    requestAnimationFrame(() => centerGraph(false));
+  }).observe(topologyEl);
+
+  // target === null -> auto-detect local LAN; otherwise scan the given CIDR/range.
+  async function runScan(target) {
+    if (target === "") {
+      meta.textContent = "Enter an IP range first (e.g. 192.168.1.0/24).";
+      return;
+    }
+    setBusy(true);
+    const what = target || "your local network";
+    meta.textContent = `Sweeping ${what} — this can take a few seconds.`;
+    tableWrap.innerHTML = '<div class="status">Scanning…</div>';
+    // Clear the previous network's graph immediately so stale nodes never linger.
+    clearTopology(`Scanning ${escapeHtml(what)}…`);
+    try {
+      const qs = new URLSearchParams({ force: "true" });
+      if (target) qs.set("target", target);
+      const res = await fetch(`${API_BASE}/api/scan?${qs}`);
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       render(data);
     } catch (err) {
       meta.textContent = "Scan failed.";
-      tableWrap.innerHTML = `<div class="status">Error: ${err.message}</div>`;
+      tableWrap.innerHTML = `<div class="status">⚠️ ${escapeHtml(err.message)}</div>`;
+      clearTopology(`⚠️ ${escapeHtml(err.message)}`);
     } finally {
-      scanBtn.disabled = false;
-      scanBtn.textContent = "Rescan";
+      setBusy(false);
     }
+  }
+
+  // Destroy any existing graph and show a centered message in its place.
+  function clearTopology(message) {
+    if (network) { network.destroy(); network = null; }
+    document.getElementById("topology").innerHTML =
+      `<div class="topo-status">${message || ""}</div>`;
+  }
+
+  function setBusy(busy) {
+    scanBtn.disabled = rangeBtn.disabled = busy;
+    scanBtn.textContent = busy ? "Scanning…" : "Scan my network";
   }
 
   function render(data) {
     const devices = data.devices || [];
-    meta.textContent =
-      `${devices.length} devices on ${data.network_cidr || "?"} · gateway ${data.gateway_ip || "unknown"}`;
+
+    // Network couldn't be reached at all -> explicit unreachable state, no graph/table.
+    if (data.reachable === false) {
+      const msg = data.note || `${data.network_cidr || "Network"} is unreachable.`;
+      meta.textContent = `⚠️ ${msg}`;
+      tableWrap.innerHTML = `<div class="status">🚫 ${escapeHtml(msg)}</div>`;
+      clearTopology(`🚫 ${escapeHtml(msg)}`);
+      return;
+    }
+
+    const summary = devices.length
+      ? `${devices.length} devices on ${data.network_cidr || "?"} · gateway ${data.gateway_ip || "unknown"}`
+      : (data.note || `No devices found on ${data.network_cidr || "?"}.`);
+    meta.textContent = summary;
     renderTable(devices);
     renderTopology(data);
   }
@@ -170,6 +260,12 @@
   function renderTopology(data) {
     const devices = data.devices || [];
     const gatewayIp = data.gateway_ip;
+
+    if (!devices.length) {
+      clearTopology(`No devices found on ${escapeHtml(data.network_cidr || "the target")}.`);
+      return;
+    }
+
     const nodes = [];
     const edges = [];
 
@@ -189,13 +285,28 @@
 
     const container = document.getElementById("topology");
     const opts = {
+      // We re-center on resize/zoom ourselves, so vis's own autoResize must be off or
+      // it keeps a stale scale/offset and drifts.
+      autoResize: false,
       nodes: { shape: "dot", size: 16, font: { color: "#e2e8f0", size: 13 }, borderWidth: 2 },
       edges: { smooth: { type: "continuous" } },
       physics: { stabilization: true, barnesHut: { gravitationalConstant: -8000, springLength: 130 } },
-      interaction: { hover: true, tooltipDelay: 120 },
+      interaction: {
+        hover: true,
+        tooltipDelay: 120,
+        dragView: false,   // no panning -> the graph can't be dragged off-center
+        zoomView: true,    // zoom stays enabled; the zoom handler keeps it centered
+      },
     };
     if (network) network.destroy();
     network = new vis.Network(container, { nodes, edges }, opts);
+
+    // Frame + center once physics settles, and immediately as a fallback.
+    network.once("stabilizationIterationsDone", () => centerGraph(false));
+    centerGraph(false);
+    // Wheel-zoom in vis zooms toward the cursor, shifting the view; re-center after
+    // each zoom (preserving the new scale) so it always grows/shrinks about the middle.
+    network.on("zoom", () => centerGraph(true));
   }
 
   function nodeFor(d) {

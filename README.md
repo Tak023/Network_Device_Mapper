@@ -60,11 +60,31 @@ frontend/
 
 API:
 
-| Method | Path                 | Description                          |
-|--------|----------------------|--------------------------------------|
-| GET    | `/api/scan?force=1`  | Run/return a scan (30s result cache) |
-| GET    | `/api/health`        | Liveness probe                       |
-| GET    | `/`                  | The embeddable widget                |
+| Method | Path                          | Description                                   |
+|--------|-------------------------------|-----------------------------------------------|
+| GET    | `/api/scan`                   | Scan the auto-detected local LAN (30s cache)  |
+| GET    | `/api/scan?target=<range>`    | Scan a specific range (see formats below)     |
+| GET    | `/api/scan?force=1`           | Bypass the cache                              |
+| GET    | `/api/health`                 | Liveness probe                               |
+| GET    | `/`                           | The embeddable widget                        |
+
+### Scanning other networks
+
+Use the **Scan range** box in the widget, or pass `target=` to the API. Accepted formats:
+
+| Format          | Example                       |
+|-----------------|-------------------------------|
+| CIDR            | `192.168.1.0/24`              |
+| Single IP       | `10.0.0.5`                    |
+| Explicit range  | `192.168.1.10-192.168.1.50`   |
+| Shorthand range | `192.168.1.10-50`             |
+
+Ranges are capped at **4096 hosts** (a `/20`) to prevent accidental massive sweeps;
+larger requests return `400` with an explanatory message. CLI equivalent:
+
+```bash
+python3 -m backend.discovery 192.168.1.0/24
+```
 
 ## Limitations & honest scope
 
