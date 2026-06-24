@@ -11,6 +11,8 @@ you can embed in any website.
 - **Discovers** every reachable device on your primary subnet.
 - **Names** them via reverse-DNS and MAC-vendor lookup.
 - **Visualizes** them as a hub-and-spoke topology around your gateway/router.
+- **Exports** the device list as **CSV** and the topology as a **PNG** (buttons in each
+  card header; generated client-side from the current scan).
 - **Embeds** anywhere — the widget is a single static page that talks to a small API.
 
 ## Quick start

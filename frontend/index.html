@@ -61,7 +61,15 @@
   .card h2 {
     font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
     color: var(--muted); margin: 0; padding: 14px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
   }
+  .export-btn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600;
+    letter-spacing: .04em; cursor: pointer; text-transform: none;
+  }
+  .export-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .export-btn:disabled { opacity: .4; cursor: not-allowed; }
   /* Fill most of the viewport so the graph is large and readable. */
   #topology { height: calc(100vh - 200px); min-height: 560px; background: radial-gradient(circle at 50% 40%, #16233b, var(--bg)); }
 
@@ -112,7 +120,7 @@
 
   <div class="layout">
     <div class="card">
-      <h2>Topology</h2>
+      <h2>Topology <button id="exportPngBtn" class="export-btn" disabled>⬇ PNG</button></h2>
       <div id="topology"></div>
       <div class="legend">
         <span class="dot-gw">Gateway</span>
@@ -124,7 +132,7 @@
     </div>
 
     <div class="card">
-      <h2>Devices</h2>
+      <h2>Devices <button id="exportCsvBtn" class="export-btn" disabled>⬇ CSV</button></h2>
       <div id="tableWrap">
         <div class="status">Click “Scan network” to discover devices.</div>
       </div>
@@ -140,13 +148,18 @@
   const rangeInput = document.getElementById("rangeInput");
   const meta = document.getElementById("meta");
   const tableWrap = document.getElementById("tableWrap");
+  const exportCsvBtn = document.getElementById("exportCsvBtn");
+  const exportPngBtn = document.getElementById("exportPngBtn");
   let network = null;
+  let lastData = null;   // most recent scan result, for exports
 
   scanBtn.addEventListener("click", () => runScan(null));
   rangeBtn.addEventListener("click", () => runScan(rangeInput.value.trim()));
   rangeInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") runScan(rangeInput.value.trim());
   });
+  exportCsvBtn.addEventListener("click", exportCsv);
+  exportPngBtn.addEventListener("click", exportPng);
 
   const topologyEl = document.getElementById("topology");
   let centering = false; // reentrancy guard: moveTo/fit must not recurse via events
@@ -222,6 +235,9 @@
 
   function render(data) {
     const devices = data.devices || [];
+    lastData = data;
+    exportCsvBtn.disabled = !devices.length;
+    exportPngBtn.disabled = !devices.length || data.reachable === false;
 
     // Network couldn't be reached at all -> explicit unreachable state, no graph/table.
     if (data.reachable === false) {
@@ -389,6 +405,61 @@
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // ---- Exports --------------------------------------------------------------
+
+  function fileSuffix() {
+    const cidr = (lastData && lastData.network_cidr) || "";
+    return cidr ? "-" + cidr.replace(/[^\w.-]/g, "_") : "";
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = Object.assign(document.createElement("a"), { href: url, download: filename });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function csvCell(v) {
+    v = v == null ? "" : String(v);
+    return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  }
+
+  function exportCsv() {
+    const devices = (lastData && lastData.devices) || [];
+    if (!devices.length) return;
+    const labelByMac = {};
+    devices.forEach((d) => { if (d.mac) labelByMac[d.mac.toLowerCase()] = d.label; });
+    const rows = [["Name", "IP", "MAC", "Vendor", "Role", "Connected To"]];
+    devices.forEach((d) => {
+      const parent = d.uplink_mac ? (labelByMac[d.uplink_mac.toLowerCase()] || d.uplink_mac) : "";
+      rows.push([d.label, d.ip, d.mac, d.vendor, d.role, parent]);
+    });
+    // BOM so Excel reads UTF-8; CRLF line endings per RFC 4180.
+    const csv = "\uFEFF" + rows.map((r) => r.map(csvCell).join(",")).join("\r\n");
+    downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), `network-devices${fileSuffix()}.csv`);
+  }
+
+  function exportPng() {
+    if (!network) return;
+    const src = topologyEl.querySelector("canvas");
+    if (!src) return;
+    // Frame the whole graph, then capture on the next frame once vis has redrawn.
+    centerGraph(false);
+    requestAnimationFrame(() => {
+      const out = document.createElement("canvas");
+      out.width = src.width;
+      out.height = src.height;
+      const ctx = out.getContext("2d");
+      // vis draws on a transparent canvas; paint the panel background first.
+      ctx.fillStyle = "#0f172a";
+      ctx.fillRect(0, 0, out.width, out.height);
+      ctx.drawImage(src, 0, 0);
+      out.toBlob((blob) => blob && downloadBlob(blob, `network-topology${fileSuffix()}.png`), "image/png");
+    });
   }
 </script>
 </body>
