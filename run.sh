@@ -6,6 +6,13 @@ cd "$(dirname "$0")"
 PYTHON="${PYTHON:-python3}"
 PORT="${PORT:-8000}"
 
+# Load UniFi (and any other) settings from a local .env if present.
+if [ -f .env ]; then
+  echo "→ Loading .env"
+  set -a; # shellcheck disable=SC1091
+  source .env; set +a
+fi
+
 if [ ! -d ".venv" ]; then
   echo "→ Creating virtual environment…"
   "$PYTHON" -m venv .venv

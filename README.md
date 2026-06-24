@@ -86,13 +86,63 @@ larger requests return `400` with an explanatory message. CLI equivalent:
 python3 -m backend.discovery 192.168.1.0/24
 ```
 
+## Real Layer-2 topology
+
+A passive ping/ARP scan **cannot** see switches or which port a device is on — a
+switch is transparent at L3, so every device looks one hop from the gateway. To draw
+the true **gateway → switch → device** hierarchy you need adjacency data from the
+infrastructure itself. Two **pluggable providers** supply it; all credentials are
+**user-supplied via `.env`** (nothing is baked in, so the app is safe to share). The
+header shows **"physical topology · SNMP/UniFi"** when live, or **"logical view"** on
+fallback. Nodes are shaped by role: ◆ gateway · ■ switch · ▲ access point · ● device.
+
+### Provider 1 — SNMP (vendor-neutral, recommended)
+
+Works across **any managed switch** (Cisco, Aruba, Netgear, MikroTik, UniFi, …) using
+the standard **LLDP-MIB** (infra links) + **Bridge-MIB** forwarding tables (device →
+port), the same approach as LibreNMS/Netdisco/OpenNMS.
+
+Requirements (per user):
+- net-snmp CLI tools — `brew install net-snmp` (macOS) / `apt install snmp` (Debian).
+- **SNMP enabled** on your switches with a read **community string**. Unmanaged
+  switches have no SNMP and remain physically undiscoverable — nothing can map them.
+
+```bash
+cp .env.example .env
+# set SNMP_COMMUNITY (e.g. "public"); optionally SNMP_TARGETS=10.1.1.1,10.1.1.2
+python3 -m backend.snmp 10.1.1.1   # test against one switch — prints the hierarchy
+./run.sh                            # auto-loads .env
+```
+
+Correlation: a port that faces another managed switch is an *uplink*; end devices are
+placed on the switch/port where they're learned on a non-uplink (edge) port. SNMP v3
+is not yet supported (v1/v2c only).
+
+### Provider 2 — UniFi controller (optional)
+
+For UniFi networks, read the LLDP topology the controller already computes:
+
+```bash
+# set UNIFI_URL + UNIFI_API_KEY in .env
+python3 -m backend.unifi        # connectivity test
+python3 -m backend.unifi --raw  # dump raw device/client JSON (field debugging)
+```
+
+- **API key** *(Network 10.1.84+)* — create at **Settings → Control Plane →
+  Integrations** (the **"API Keys"** tab); stateless `X-API-KEY`, no MFA.
+- **Local admin** *(older controllers)* — `UNIFI_USERNAME`/`UNIFI_PASSWORD`.
+
+> Providers are tried **SNMP → UniFi → L3 star**. Configure whichever fits; if none is
+> set (or the provider is unreachable) the app degrades gracefully — no errors.
+
 ## Limitations & honest scope
 
-- Discovers **layer-3 reachable hosts** on your subnet. It does **not** infer
-  physical switch-port wiring — true L2 topology needs **LLDP/CDP/SNMP** against
-  managed switches (a sensible future phase).
-- Topology is **hub-and-spoke** off the gateway, which is the accurate shape for a
-  flat home/SMB LAN.
+- Without a topology provider it discovers **layer-3 reachable hosts** only and shows a
+  **hub-and-spoke** logical view — accurate for a flat LAN, but not physical wiring.
+- **Unmanaged switches are physically undiscoverable** by any method (no SNMP, no IP) —
+  devices behind them attach to the nearest *managed* switch the data can see.
+- SNMP topology can need per-network tuning (VLANs, LAGs, vendor quirks); use
+  `python3 -m backend.snmp <switch-ip>` to validate against your gear.
 - Devices with strict firewalls (no ICMP, no ARP response when idle) may be missed.
 - The MAC-vendor database is optional; names degrade gracefully without it.
 

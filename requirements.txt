@@ -1,4 +1,9 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
+# Real Layer-2 topology providers (optional; L3 star fallback without them):
+#   * SNMP provider also needs the net-snmp CLI (system package, not pip):
+#       macOS: brew install net-snmp   |   Debian/Ubuntu: apt install snmp
+#   * UniFi provider uses requests:
+requests>=2.31
 # Optional: human-readable MAC vendor names. Discovery degrades gracefully without it.
 mac-vendor-lookup>=0.1.12

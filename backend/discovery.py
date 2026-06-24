@@ -46,10 +46,16 @@ class Device:
     vendor: Optional[str] = None
     is_gateway: bool = False
     is_self: bool = False
+    # Physical topology (populated from UniFi when available).
+    uplink_mac: Optional[str] = None   # MAC of the device this connects up to
+    role: Optional[str] = None         # gateway | switch | ap | client
+    unifi_name: Optional[str] = None   # controller-assigned name (e.g. "Office Switch")
 
     @property
     def label(self) -> str:
         """Best human-readable name for a node/table row."""
+        if self.unifi_name:
+            return self.unifi_name
         if self.hostname:
             return self.hostname
         if self.vendor:
@@ -65,6 +71,7 @@ class ScanResult:
     devices: list[Device] = field(default_factory=list)
     reachable: bool = True          # False == no route / network appears unreachable
     note: Optional[str] = None      # human-readable status for the UI
+    topology_source: str = "l3-star"  # "unifi" when real L2 adjacency is available
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -359,6 +366,61 @@ def _is_on_link(network: Optional[ipaddress.IPv4Network]) -> bool:
     return False
 
 
+def _apply_topology(devices: list[Device], result: ScanResult) -> None:
+    """Overlay real L2 adjacency from a topology provider (SNMP/UniFi), in place.
+
+    - Matches discovered devices to provider nodes by MAC and sets uplink_mac/role/name.
+    - Adds infra (switches/APs/gateway) the ping sweep missed, so a device's parent
+      always exists in the graph.
+    - Leaves everything untouched (L3-star fallback) when no provider is configured.
+    """
+    try:
+        from . import topology
+    except ImportError:
+        return
+
+    device_macs = {d.ip: d.mac for d in devices if d.mac and d.ip}
+    nodes, source = topology.fetch_topology(device_macs, result.gateway_ip)
+    if not nodes:
+        return
+
+    by_mac = {d.mac.lower(): d for d in devices if d.mac}
+
+    # 1. Enrich discovered devices.
+    for mac, node in nodes.items():
+        dev = by_mac.get(mac)
+        if dev:
+            dev.uplink_mac = node.uplink_mac
+            dev.role = node.role
+            if node.name:
+                dev.unifi_name = node.name
+            if node.role == "gateway":
+                dev.is_gateway = True
+
+    # 2. Add infra nodes the sweep didn't find (e.g. an AP on another VLAN), so a
+    #    device's parent always exists in the graph.
+    referenced = {n.uplink_mac for n in nodes.values() if n.uplink_mac}
+    present = set(by_mac)
+    for mac, node in nodes.items():
+        need = node.is_infra or mac in referenced
+        if need and mac not in present:
+            devices.append(Device(
+                ip=node.ip or mac,
+                mac=mac,
+                role=node.role,
+                uplink_mac=node.uplink_mac,
+                unifi_name=node.name,
+                is_gateway=(node.role == "gateway"),
+            ))
+            present.add(mac)
+
+    result.topology_source = source
+    if result.gateway_ip is None:
+        gw = next((n for n in nodes.values() if n.role == "gateway" and n.ip), None)
+        if gw:
+            result.gateway_ip = gw.ip
+
+
 def scan(target: Optional[str] = None) -> ScanResult:
     """Discover devices on the local subnet, or on an explicit `target` range.
 
@@ -417,6 +479,9 @@ def scan(target: Optional[str] = None) -> ScanResult:
             is_self=(ip == self_ip),
         )
         devices.append(dev)
+
+    # Enrich with real Layer-2 topology from a provider (SNMP/UniFi), if configured.
+    _apply_topology(devices, result)
 
     result.devices = devices
 

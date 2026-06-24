@@ -84,6 +84,8 @@
   .legend { display: flex; gap: 16px; padding: 6px 16px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
   .legend span::before { content: "●"; margin-right: 5px; }
   .dot-gw::before { color: var(--gateway); }
+  .dot-sw::before { color: #a78bfa; }
+  .dot-ap::before { color: #22d3ee; }
   .dot-self::before { color: var(--self); }
   .dot-dev::before { color: var(--accent); }
 
@@ -113,9 +115,11 @@
       <h2>Topology</h2>
       <div id="topology"></div>
       <div class="legend">
-        <span class="dot-gw">Gateway / Router</span>
+        <span class="dot-gw">Gateway</span>
+        <span class="dot-sw">Switch</span>
+        <span class="dot-ap">Access point</span>
         <span class="dot-self">This device</span>
-        <span class="dot-dev">Discovered device</span>
+        <span class="dot-dev">Device</span>
       </div>
     </div>
 
@@ -228,8 +232,13 @@
       return;
     }
 
+    const SOURCE_LABEL = { snmp: "physical topology · SNMP", unifi: "physical topology · UniFi" };
+    const realTopo = data.topology_source && data.topology_source !== "l3-star";
+    const view = realTopo
+      ? (SOURCE_LABEL[data.topology_source] || "physical topology")
+      : "logical view (no switch data)";
     const summary = devices.length
-      ? `${devices.length} devices on ${data.network_cidr || "?"} · gateway ${data.gateway_ip || "unknown"}`
+      ? `${devices.length} devices on ${data.network_cidr || "?"} · ${view}`
       : (data.note || `No devices found on ${data.network_cidr || "?"}.`);
     meta.textContent = summary;
     renderTable(devices);
@@ -268,18 +277,42 @@
 
     const nodes = [];
     const edges = [];
+    const realTopology = data.topology_source && data.topology_source !== "l3-star";
 
-    // Synthesize a gateway node even if it didn't answer, so spokes have a hub.
-    const haveGateway = devices.some((d) => d.is_gateway);
-    if (gatewayIp && !haveGateway) {
-      nodes.push(gatewayNode({ ip: gatewayIp, label: "Gateway" }));
-    }
+    // Stable node id: prefer MAC (UniFi adjacency is keyed by MAC), fall back to IP.
+    const idSet = new Set(devices.map(idOf));
 
-    for (const d of devices) {
-      nodes.push(nodeFor(d));
-      const hub = gatewayIp || (devices[0] && devices[0].ip);
-      if (hub && d.ip !== hub) {
-        edges.push({ from: hub, to: d.ip, color: { color: "#334155" }, width: 1 });
+    if (realTopology) {
+      // Draw the true hierarchy: each device links to its parent (uplink_mac).
+      const gwDev = devices.find((d) => d.is_gateway);
+      const gwId = gwDev ? idOf(gwDev) : null;
+      for (const d of devices) nodes.push(nodeFor(d));
+      for (const d of devices) {
+        if (d.is_gateway) continue; // root, no parent
+        const parent = (d.uplink_mac || "").toLowerCase();
+        if (parent && parent !== idOf(d) && idSet.has(parent)) {
+          edges.push({ from: parent, to: idOf(d), color: { color: "#334155" }, width: 1.5 });
+        } else if (gwId && idOf(d) !== gwId) {
+          // UniFi doesn't track this device's uplink -> attach to gateway, dashed to
+          // signal it's inferred (not real adjacency).
+          edges.push({ from: gwId, to: idOf(d), color: { color: "#334155" }, width: 1, dashes: true });
+        }
+      }
+    } else {
+      // L3 fallback: hub-and-spoke off the gateway (no physical wiring available).
+      const gwDev = devices.find((d) => d.is_gateway);
+      let hub = gwDev ? idOf(gwDev) : null;
+      if (!gwDev && gatewayIp) {
+        nodes.push(gatewayNode({ ip: gatewayIp, label: "Gateway" }));
+        idSet.add(gatewayIp);
+        hub = gatewayIp;
+      }
+      if (!hub && devices[0]) hub = idOf(devices[0]);
+      for (const d of devices) {
+        nodes.push(nodeFor(d));
+        if (hub && idOf(d) !== hub) {
+          edges.push({ from: hub, to: idOf(d), color: { color: "#334155" }, width: 1 });
+        }
       }
     }
 
@@ -309,11 +342,32 @@
     network.on("zoom", () => centerGraph(true));
   }
 
+  // Stable node id: MAC (lowercased) when known, else IP. Must match how the backend
+  // keys uplink_mac so adjacency edges resolve.
+  function idOf(d) {
+    return d.mac ? d.mac.toLowerCase() : d.ip;
+  }
+
+  // Shape/colour per infrastructure role so the hierarchy reads at a glance.
+  const ROLE_STYLE = {
+    gateway: { shape: "diamond", size: 28, color: "#f59e0b" }, // amber
+    switch:  { shape: "square",  size: 22, color: "#a78bfa" }, // violet
+    ap:      { shape: "triangle", size: 20, color: "#22d3ee" }, // cyan
+  };
+
   function nodeFor(d) {
-    if (d.is_gateway) return gatewayNode(d);
+    if (d.is_gateway || d.role === "gateway") return gatewayNode(d);
+    const roleStyle = ROLE_STYLE[d.role];
+    if (roleStyle) {
+      return {
+        id: idOf(d), label: d.label, shape: roleStyle.shape, size: roleStyle.size,
+        color: { background: roleStyle.color, border: "#0f172a" },
+        title: tooltip(d),
+      };
+    }
     const color = d.is_self ? "#34d399" : "#38bdf8";
     return {
-      id: d.ip, label: d.label, value: d.is_self ? 3 : 2,
+      id: idOf(d), label: d.label, shape: "dot", value: d.is_self ? 3 : 2,
       color: { background: color, border: "#0f172a" },
       title: tooltip(d),
     };
@@ -321,14 +375,15 @@
 
   function gatewayNode(d) {
     return {
-      id: d.ip, label: d.label || "Gateway", shape: "diamond", size: 26,
+      id: idOf(d), label: d.label || "Gateway", shape: "diamond", size: 28,
       color: { background: "#f59e0b", border: "#0f172a" },
       title: tooltip(d),
     };
   }
 
   function tooltip(d) {
-    return [d.label, d.ip, d.mac, d.vendor].filter(Boolean).join("\n");
+    const role = d.role ? d.role.toUpperCase() : null;
+    return [d.label, role, d.ip, d.mac, d.vendor].filter(Boolean).join("\n");
   }
 
   function escapeHtml(s) {
