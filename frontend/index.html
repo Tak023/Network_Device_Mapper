@@ -122,6 +122,49 @@
   .missing li { margin: 3px 0; }
   .missing ul { margin: 6px 0 0; padding-left: 18px; }
 
+  .devicon { margin-right: 6px; }
+  td.ping { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+  td.ping.slow { color: var(--gateway); }
+
+  .edit-btn {
+    background: none; border: 0; color: var(--muted); cursor: pointer;
+    font-size: 13px; padding: 0 4px; opacity: 0; transition: opacity .1s;
+  }
+  tr:hover .edit-btn { opacity: 1; }
+  .edit-btn:hover { color: var(--accent); }
+
+  #autoSelect {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 8px; font-size: 13px; cursor: pointer;
+  }
+  #autoSelect:focus { outline: none; border-color: var(--accent); }
+
+  /* Device edit modal */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(2, 6, 23, .6); z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .overlay.hidden { display: none; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; width: 400px; max-width: 92vw; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .modal h3 { margin: 0 0 6px; font-size: 15px; }
+  .modal .device-info {
+    color: var(--muted); font-size: 12px; margin-bottom: 12px; line-height: 1.6;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .modal label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  .modal input, .modal textarea {
+    width: 100%; box-sizing: border-box; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font-size: 14px; font-family: inherit; resize: vertical;
+  }
+  .modal input:focus, .modal textarea:focus { outline: none; border-color: var(--accent); }
+  .modal-actions { display: flex; gap: 8px; margin-top: 16px; align-items: center; }
+  .modal-actions .spacer { flex: 1; }
+  .modal-status { margin-top: 10px; font-size: 12px; color: var(--muted); min-height: 16px; }
+
   .legend { display: flex; gap: 16px; padding: 6px 16px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
   .legend span::before { content: "●"; margin-right: 5px; }
   .dot-gw::before { color: var(--gateway); }
@@ -152,8 +195,34 @@
              placeholder="e.g. 192.168.1.0/24 or 10.0.0.1-50" />
       <button id="rangeBtn" class="secondary">Scan range</button>
       <button id="scanBtn">Scan my network</button>
+      <select id="autoSelect" title="Automatically repeat the last scan">
+        <option value="0">Auto: off</option>
+        <option value="60">Auto: 1 min</option>
+        <option value="300">Auto: 5 min</option>
+        <option value="900">Auto: 15 min</option>
+      </select>
     </div>
   </header>
+
+  <!-- Device edit modal: custom name, notes, Wake-on-LAN -->
+  <div id="modalOverlay" class="overlay hidden">
+    <div class="modal">
+      <h3 id="modalTitle">Edit device</h3>
+      <div class="device-info" id="modalInfo"></div>
+      <label for="modalName">Name</label>
+      <input id="modalName" type="text" placeholder="e.g. Living Room TV" maxlength="64" />
+      <label for="modalNotes">Notes</label>
+      <textarea id="modalNotes" rows="3" maxlength="500"
+                placeholder="e.g. static IP, port 8 on the office switch"></textarea>
+      <div class="modal-actions">
+        <button id="modalWake" class="secondary" title="Send a Wake-on-LAN magic packet">⚡ Wake</button>
+        <span class="spacer"></span>
+        <button id="modalCancel" class="secondary">Cancel</button>
+        <button id="modalSave">Save</button>
+      </div>
+      <div class="modal-status" id="modalStatus"></div>
+    </div>
+  </div>
 
   <div class="layout">
     <div class="card">
@@ -199,8 +268,9 @@
   const exportCsvBtn = document.getElementById("exportCsvBtn");
   const exportPngBtn = document.getElementById("exportPngBtn");
   let network = null;
-  let lastData = null;   // most recent scan result, for exports
-  let sortKey = "ip";    // current table sort column
+  let lastData = null;       // most recent scan result, for exports
+  let lastScanTarget;        // last scanned target (null = local LAN); undefined = never scanned
+  let sortKey = "ip";        // current table sort column
   let sortAsc = true;
 
   scanBtn.addEventListener("click", () => runScan(null));
@@ -254,6 +324,7 @@
       meta.textContent = "Enter an IP range first (e.g. 192.168.1.0/24).";
       return;
     }
+    lastScanTarget = target;  // remembered for the auto-rescan timer
     setBusy(true);
     const what = target || "your local network";
     meta.textContent = `Sweeping ${what} — this can take a few seconds.`;
@@ -363,19 +434,58 @@
   // ---- Device table: filterable + sortable ----------------------------------
 
   const COLUMNS = [
-    { key: "label",  title: "Device" },
-    { key: "ip",     title: "IP address" },
-    { key: "mac",    title: "MAC" },
-    { key: "vendor", title: "Vendor" },
+    { key: "label",      title: "Device" },
+    { key: "ip",         title: "IP address" },
+    { key: "mac",        title: "MAC" },
+    { key: "vendor",     title: "Vendor" },
+    { key: "latency_ms", title: "Ping" },
   ];
 
-  // Numeric IP sort; everything else case-insensitive text with blanks last.
+  // Numeric IP/latency sort; everything else case-insensitive text, blanks last.
   function sortValue(d, key) {
     if (key === "ip") {
       return d.ip.split(".").reduce((n, o) => n * 256 + (+o), 0);
     }
+    if (key === "latency_ms") {
+      return d.latency_ms == null ? Infinity : d.latency_ms;
+    }
     const v = d[key];
     return v ? String(v).toLowerCase() : "￿";
+  }
+
+  // Device-type icon: role first (authoritative), then hostname/vendor keywords.
+  const ICON_RULES = [
+    [/iphone|ipad|pixel|galaxy|oneplus|android|smartphone/, "📱"],
+    [/macbook|laptop|thinkpad|notebook/, "💻"],
+    [/apple.?tv|roku|chromecast|bravia|firetv|shield|vizio|\btv\b/, "📺"],
+    [/playstation|sony interactive|nintendo|xbox/, "🎮"],
+    [/printer|xerox|brother industries|seiko epson|canon|lexmark/, "🖨️"],
+    [/truenas|synology|qnap|unraid|fileserver|\bnas\b/, "🗄️"],
+    [/doorbell|camera|\bcam\b|ring\b|wyze|hikvision|reolink|axis comm/, "📷"],
+    [/sonos|homepod|\becho\b|speaker|denon|yamaha/, "🔊"],
+    [/espressif|tuya|shelly|tasmota|nanoleaf|hue|lifx|wemo|sensor|plug/, "💡"],
+    [/roomba|irobot|roborock|vacuum/, "🤖"],
+    [/raspberry/, "🍓"],
+    [/vmware|virtualbox|qemu|proxmox|parallels/, "🖥️"],
+    [/ubiquiti|tp-link|netgear|cisco|mikrotik|aruba|zyxel/, "📡"],
+    [/idrac|\bipmi\b|ilo\b/, "🔧"],
+    [/dell|hewlett|asus|asrock|micro-star|gigabyte|intel corp|lenovo|acer/, "🖥️"],
+    [/apple/, "🍎"],
+  ];
+
+  function deviceIcon(d) {
+    if (d.is_gateway || d.role === "gateway") return "🌐";
+    if (d.role === "switch") return "🔀";
+    if (d.role === "ap") return "📶";
+    const hay = `${d.label || ""} ${d.hostname || ""} ${d.unifi_name || ""} ${d.vendor || ""}`.toLowerCase();
+    for (const [re, icon] of ICON_RULES) if (re.test(hay)) return icon;
+    return "💻";
+  }
+
+  function pingCell(d) {
+    if (d.latency_ms == null) return '<td class="ping">—</td>';
+    const slow = d.latency_ms > 100 ? " slow" : "";
+    return `<td class="ping${slow}">${d.latency_ms.toFixed(1)} ms</td>`;
   }
 
   function setSort(key) {
@@ -407,16 +517,19 @@
       const arrow = c.key === sortKey ? `<span class="arrow">${sortAsc ? "▲" : "▼"}</span>` : "";
       return `<th class="sortable" data-key="${c.key}">${c.title}${arrow}</th>`;
     }).join("");
-    const rows = shown.map((d) => {
+    const rows = shown.map((d, i) => {
       const badges =
         (d.is_gateway ? '<span class="badge gw">GATEWAY</span>' : "") +
         (d.is_self ? '<span class="badge self">THIS PC</span>' : "") +
         (d.is_new && !d.is_self ? '<span class="badge new" title="First time seen on this network">NEW</span>' : "");
+      const noteMark = d.notes ? ` <span title="${escapeHtml(d.notes)}">🗒</span>` : "";
       return `<tr>
-        <td>${escapeHtml(d.label)}${badges}</td>
+        <td><span class="devicon">${deviceIcon(d)}</span>${escapeHtml(d.label)}${badges}${noteMark}
+            <button class="edit-btn" data-idx="${i}" title="Rename / notes / wake">✎</button></td>
         <td class="ip">${escapeHtml(d.ip)}</td>
         <td class="mac">${escapeHtml(d.mac || "—")}</td>
         <td>${escapeHtml(d.vendor || "—")}</td>
+        ${pingCell(d)}
       </tr>`;
     }).join("");
     tableWrap.innerHTML = `<table>
@@ -424,6 +537,8 @@
       <tbody>${rows}</tbody></table>`;
     tableWrap.querySelectorAll("th.sortable").forEach((th) =>
       th.addEventListener("click", () => setSort(th.dataset.key)));
+    tableWrap.querySelectorAll(".edit-btn").forEach((btn) =>
+      btn.addEventListener("click", () => openModal(shown[+btn.dataset.idx])));
   }
 
   // Devices seen on this network in past scans but absent from this one.
@@ -448,6 +563,129 @@
     if (s < 129600) return `${Math.round(s / 3600)} h ago`;
     return `${Math.round(s / 86400)} days ago`;
   }
+
+  // ---- Device edit modal (name / notes / wake) -------------------------------
+
+  const modalOverlay = document.getElementById("modalOverlay");
+  const modalTitle = document.getElementById("modalTitle");
+  const modalInfo = document.getElementById("modalInfo");
+  const modalName = document.getElementById("modalName");
+  const modalNotes = document.getElementById("modalNotes");
+  const modalStatus = document.getElementById("modalStatus");
+  const modalWake = document.getElementById("modalWake");
+  let modalDevice = null;
+
+  function apiHeaders() {
+    const h = { "Content-Type": "application/json" };
+    if (API_TOKEN) h["X-API-Token"] = API_TOKEN;
+    return h;
+  }
+
+  // What the label falls back to when there's no custom name (mirrors the backend).
+  function derivedLabel(d) {
+    return d.unifi_name || d.hostname ||
+           (d.vendor ? `${d.vendor} device` : d.ip);
+  }
+
+  function deviceKey(d) {
+    return d.mac ? d.mac.toLowerCase() : d.ip;
+  }
+
+  function openModal(d) {
+    modalDevice = d;
+    modalTitle.textContent = `${deviceIcon(d)} ${derivedLabel(d)}`;
+    modalInfo.textContent = [d.ip, d.mac, d.vendor].filter(Boolean).join("  ·  ");
+    modalName.value = d.custom_name || "";
+    modalNotes.value = d.notes || "";
+    modalStatus.textContent = "";
+    modalWake.disabled = !d.mac;
+    modalWake.title = d.mac ? "Send a Wake-on-LAN magic packet"
+                            : "No MAC known for this device";
+    modalOverlay.classList.remove("hidden");
+    modalName.focus();
+  }
+
+  function closeModal() {
+    modalOverlay.classList.add("hidden");
+    modalDevice = null;
+  }
+
+  document.getElementById("modalCancel").addEventListener("click", closeModal);
+  modalOverlay.addEventListener("click", (e) => {
+    if (e.target === modalOverlay) closeModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && modalDevice) closeModal();
+  });
+
+  document.getElementById("modalSave").addEventListener("click", async () => {
+    if (!modalDevice) return;
+    const d = modalDevice;
+    modalStatus.textContent = "Saving…";
+    try {
+      const res = await fetch(`${API_BASE}/api/device-meta`, {
+        method: "POST",
+        headers: apiHeaders(),
+        body: JSON.stringify({
+          key: deviceKey(d),
+          custom_name: modalName.value.trim(),
+          notes: modalNotes.value.trim(),
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      d.custom_name = modalName.value.trim() || undefined;
+      d.notes = modalNotes.value.trim() || undefined;
+      d.label = d.custom_name || derivedLabel(d);
+      closeModal();
+      render(lastData);  // refresh table + topology labels
+    } catch (err) {
+      modalStatus.textContent = `⚠️ ${err.message}`;
+    }
+  });
+
+  modalWake.addEventListener("click", async () => {
+    if (!modalDevice || !modalDevice.mac) return;
+    modalStatus.textContent = "Sending magic packet…";
+    try {
+      const res = await fetch(`${API_BASE}/api/wol`, {
+        method: "POST",
+        headers: apiHeaders(),
+        body: JSON.stringify({ mac: modalDevice.mac }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      modalStatus.textContent = "⚡ Magic packet sent. The device may take ~30s to wake.";
+    } catch (err) {
+      modalStatus.textContent = `⚠️ ${err.message}`;
+    }
+  });
+
+  // ---- Auto-rescan -----------------------------------------------------------
+
+  const autoSelect = document.getElementById("autoSelect");
+  let autoTimer = null;
+  autoSelect.value = localStorage.getItem("ndm-auto-rescan") || "0";
+  if (![...autoSelect.options].some((o) => o.value === autoSelect.value)) {
+    autoSelect.value = "0";
+  }
+  autoSelect.addEventListener("change", applyAutoRescan);
+
+  function applyAutoRescan() {
+    localStorage.setItem("ndm-auto-rescan", autoSelect.value);
+    if (autoTimer) clearInterval(autoTimer);
+    autoTimer = null;
+    const seconds = parseInt(autoSelect.value, 10);
+    if (seconds > 0) {
+      autoTimer = setInterval(() => {
+        // Repeat the last scan; skip if one hasn't run yet or is in flight.
+        if (lastScanTarget !== undefined && !scanBtn.disabled) {
+          runScan(lastScanTarget);
+        }
+      }, seconds * 1000);
+    }
+  }
+  applyAutoRescan();
 
   function renderTopology(data) {
     const devices = data.devices || [];
@@ -550,7 +788,9 @@
     }
     const color = d.is_self ? "#34d399" : "#38bdf8";
     return {
-      id: idOf(d), label: d.label, shape: "dot", value: d.is_self ? 3 : 2,
+      // Icon prefix on client labels; infra nodes already encode role via shape.
+      id: idOf(d), label: `${deviceIcon(d)} ${d.label}`, shape: "dot",
+      value: d.is_self ? 3 : 2,
       color: { background: color, border: "#0f172a" },
       title: tooltip(d),
     };
@@ -600,11 +840,13 @@
     if (!devices.length) return;
     const labelByMac = {};
     devices.forEach((d) => { if (d.mac) labelByMac[d.mac.toLowerCase()] = d.label; });
-    const rows = [["Name", "IP", "MAC", "Vendor", "Role", "Connected To", "First Seen"]];
+    const rows = [["Name", "IP", "MAC", "Vendor", "Role", "Connected To",
+                   "Ping (ms)", "First Seen", "Notes"]];
     devices.forEach((d) => {
       const parent = d.uplink_mac ? (labelByMac[d.uplink_mac.toLowerCase()] || d.uplink_mac) : "";
       const firstSeen = d.first_seen ? new Date(d.first_seen * 1000).toISOString() : "";
-      rows.push([d.label, d.ip, d.mac, d.vendor, d.role, parent, firstSeen]);
+      const ping = d.latency_ms == null ? "" : d.latency_ms.toFixed(1);
+      rows.push([d.label, d.ip, d.mac, d.vendor, d.role, parent, ping, firstSeen, d.notes]);
     });
     // BOM so Excel reads UTF-8; CRLF line endings per RFC 4180.
     const csv = "\uFEFF" + rows.map((r) => r.map(csvCell).join(",")).join("\r\n");

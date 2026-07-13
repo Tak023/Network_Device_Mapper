@@ -5,6 +5,7 @@ pin fixtures for each one we claim to support.
 """
 
 from backend.discovery import (
+    _extract_latency,
     _is_real_lan,
     _normalize_mac,
     _parse_ifconfig,
@@ -91,3 +92,24 @@ def test_parse_neighbors_ip_neigh_format():
 
 def test_normalize_mac_pads_octets():
     assert _normalize_mac("0:1:2:A:BB:C") == "00:01:02:0a:bb:0c"
+
+
+MACOS_PING = """\
+PING 10.1.1.1 (10.1.1.1): 56 data bytes
+64 bytes from 10.1.1.1: icmp_seq=0 ttl=64 time=1.234 ms
+
+--- 10.1.1.1 ping statistics ---
+1 packets transmitted, 1 packets received, 0.0% packet loss
+"""
+
+LINUX_PING = """\
+PING 10.1.1.1 (10.1.1.1) 56(84) bytes of data.
+64 bytes from 10.1.1.1: icmp_seq=1 ttl=64 time=0.847 ms
+"""
+
+
+def test_extract_latency():
+    assert _extract_latency(MACOS_PING) == 1.234
+    assert _extract_latency(LINUX_PING) == 0.847
+    assert _extract_latency("time<1 ms") == 1.0  # sub-ms "time<1ms" style
+    assert _extract_latency("no timing here") is None

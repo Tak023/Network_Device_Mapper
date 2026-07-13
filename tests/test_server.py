@@ -107,3 +107,55 @@ def test_stream_emits_progress_then_done(client):
 def test_stream_rejects_bad_target(client):
     r = client.get("/api/scan/stream?target=not-an-ip")
     assert r.status_code == 400
+
+
+def test_device_meta_roundtrip(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    r = client.post("/api/device-meta", json={
+        "key": "aa:aa:aa:aa:aa:50", "custom_name": "Office printer", "notes": "3rd floor",
+    })
+    assert r.status_code == 200 and r.json() == {"ok": True}
+
+    from backend import history
+    data = {"network_cidr": "10.0.0.0/24",
+            "devices": [{"ip": "10.0.0.5", "mac": "aa:aa:aa:aa:aa:50", "label": "x"}]}
+    history.annotate(data)
+    assert data["devices"][0]["label"] == "Office printer"
+
+
+def test_device_meta_requires_key(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    assert client.post("/api/device-meta", json={"key": "  "}).status_code == 400
+
+
+def test_device_meta_503_when_history_disabled(client):
+    # fixture sets NDM_DB=off
+    r = client.post("/api/device-meta", json={"key": "aa:aa:aa:aa:aa:50", "custom_name": "x"})
+    assert r.status_code == 503
+
+
+def test_device_meta_clears_scan_cache(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    client.get("/api/scan")
+    client.post("/api/device-meta", json={"key": "aa:aa:aa:aa:aa:50", "custom_name": "x"})
+    client.get("/api/scan")  # would be a cache hit if the rename hadn't cleared it
+    assert len(client.scan_calls) == 2
+
+
+def test_wol_sends_packet(client, monkeypatch):
+    sent = []
+    monkeypatch.setattr(server.wol, "wake", lambda mac: sent.append(mac))
+    r = client.post("/api/wol", json={"mac": "a4:5e:60:aa:bb:cc"})
+    assert r.status_code == 200
+    assert sent == ["a4:5e:60:aa:bb:cc"]
+
+
+def test_wol_rejects_bad_mac(client):
+    r = client.post("/api/wol", json={"mac": "not-a-mac"})
+    assert r.status_code == 400
+
+
+def test_post_endpoints_require_token_when_set(client, monkeypatch):
+    monkeypatch.setenv("NDM_API_TOKEN", "sekrit")
+    assert client.post("/api/wol", json={"mac": "a4:5e:60:aa:bb:cc"}).status_code == 401
+    assert client.post("/api/device-meta", json={"key": "x"}).status_code == 401

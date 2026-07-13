@@ -20,6 +20,13 @@ Runs **two ways** (same features, same backend — pick either or both):
 - **Visualizes** them as a hub-and-spoke topology around your gateway/router.
 - **Remembers** past scans (SQLite) and flags devices that are **NEW** or have
   **gone missing** since the last scan of that network.
+- **Custom names & notes** — click ✎ on any device to name it ("Living Room TV")
+  and add notes; names persist across scans and follow the device's MAC.
+- **Ping latency** per device, with slow responders highlighted.
+- **Device-type icons** (📱 💻 📺 🎮 🖨️ …) inferred from vendor/hostname.
+- **Auto-rescan** — repeat the last scan every 1/5/15 minutes; NEW/missing
+  update live.
+- **Wake-on-LAN** — wake a sleeping device straight from its edit dialog.
 - **Streams progress** live while scanning (ping sweep counts, name resolution, SNMP).
 - **Sortable, filterable table** — click any column header; type to filter.
 - **Exports** the device list as **CSV** and the topology as a **PNG** (buttons in each
@@ -119,6 +126,8 @@ API:
 | GET    | `/api/scan?target=<range>`    | Scan a specific range (see formats below)     |
 | GET    | `/api/scan?force=1`           | Bypass the cache                              |
 | GET    | `/api/scan/stream`            | Same scan as SSE with live progress events    |
+| POST   | `/api/device-meta`            | Set a custom name/notes: `{key, custom_name, notes}` (key = MAC or IP; empty strings clear) |
+| POST   | `/api/wol`                    | Send a Wake-on-LAN magic packet: `{mac}`      |
 | GET    | `/api/health`                 | Liveness probe                               |
 | GET    | `/`                           | The embeddable widget                        |
 

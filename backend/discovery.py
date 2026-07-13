@@ -48,6 +48,7 @@ class Device:
     mac: str | None = None
     hostname: str | None = None
     vendor: str | None = None
+    latency_ms: float | None = None  # ICMP round-trip; None if ARP-only discovery
     is_gateway: bool = False
     is_self: bool = False
     # Physical topology (populated from UniFi when available).
@@ -266,8 +267,21 @@ def _local_network() -> tuple[str | None, str | None, ipaddress.IPv4Network | No
 # Sweep + ARP
 # --------------------------------------------------------------------------- #
 
-def _ping(ip: str) -> str | None:
-    """Send one ICMP echo. Returns the ip on reply, else None."""
+# `64 bytes from 10.1.1.1: icmp_seq=0 ttl=64 time=1.234 ms` (macOS and Linux)
+_PING_TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms")
+
+
+def _extract_latency(output: str) -> float | None:
+    m = _PING_TIME_RE.search(output)
+    return float(m.group(1)) if m else None
+
+
+def _ping(ip: str) -> tuple[str, float | None] | None:
+    """Send one ICMP echo. Returns (ip, latency_ms) on reply, else None.
+
+    Latency comes from ping's own `time=` report, not our subprocess wall time —
+    process spawn adds 10-30ms of noise that would swamp LAN round-trips.
+    """
     # -c 1: one packet. macOS/BSD use -t for total timeout (s); Linux uses -W (s).
     timeout_flag = "-t" if sys.platform == "darwin" else "-W"
     try:
@@ -276,22 +290,27 @@ def _ping(ip: str) -> str | None:
             capture_output=True,
             timeout=PING_TIMEOUT_S + 1.0,
         )
-        return ip if proc.returncode == 0 else None
+        if proc.returncode != 0:
+            return None
+        return ip, _extract_latency(proc.stdout.decode("utf-8", errors="replace"))
     except subprocess.TimeoutExpired:
         return None
     except OSError:
         return None
 
 
-def _ping_sweep(hosts: list[str], progress: ProgressFn | None = None) -> set[str]:
-    alive: set[str] = set()
+def _ping_sweep(
+    hosts: list[str], progress: ProgressFn | None = None
+) -> dict[str, float | None]:
+    """{ip: latency_ms} for every host that answered ICMP."""
+    alive: dict[str, float | None] = {}
     total = len(hosts)
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         for result in pool.map(_ping, hosts):
             done += 1
             if result:
-                alive.add(result)
+                alive[result[0]] = result[1]
             # Every ~5% is plenty for a UI; avoids thousands of callbacks on a /20.
             if progress and (done % max(1, total // 20) == 0 or done == total):
                 progress("sweep", done, total)
@@ -546,7 +565,7 @@ def scan(
 
     arp = _arp_table()
     # Union of ping replies and ARP entries: some devices answer ARP but drop ICMP.
-    discovered_ips = (alive | set(arp)) & host_set
+    discovered_ips = (set(alive) | set(arp)) & host_set
     if self_ip and self_ip in host_set:  # only when our own IP is within the target
         discovered_ips.add(self_ip)
 
@@ -573,6 +592,7 @@ def scan(
             mac=mac,
             hostname=hostnames.get(ip),
             vendor=vendor_of(mac) if mac else None,
+            latency_ms=alive.get(ip),
             is_gateway=(ip == gateway),
             is_self=(ip == self_ip),
         )

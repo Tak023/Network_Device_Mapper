@@ -64,3 +64,36 @@ def test_disabled_via_env(tmp_path, monkeypatch):
     history.annotate(data)
     assert "is_new" not in data["devices"][0]
     assert "missing_devices" not in data
+
+
+def test_custom_name_overrides_label(tmp_path, monkeypatch):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    assert history.set_meta("aa:aa:aa:aa:aa:50", "Living Room TV", "on the credenza")
+
+    data = _scan([_dev("192.168.1.50", "AA:AA:AA:AA:AA:50", "Samsung device")])
+    history.annotate(data)
+    dev = data["devices"][0]
+    assert dev["label"] == "Living Room TV"
+    assert dev["custom_name"] == "Living Room TV"
+    assert dev["notes"] == "on the credenza"
+
+    # The stored history label carries the custom name into the missing-list.
+    data2 = _scan([_dev("192.168.1.1", "aa:aa:aa:aa:aa:01")])
+    history.annotate(data2)
+    assert [m["label"] for m in data2["missing_devices"]] == ["Living Room TV"]
+
+
+def test_clearing_meta_restores_derived_label(tmp_path, monkeypatch):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    history.set_meta("aa:aa:aa:aa:aa:50", "Temp Name")
+    history.set_meta("aa:aa:aa:aa:aa:50", "", "")  # empty both -> delete
+
+    data = _scan([_dev("192.168.1.50", "aa:aa:aa:aa:aa:50", "Samsung device")])
+    history.annotate(data)
+    assert data["devices"][0]["label"] == "Samsung device"
+    assert "custom_name" not in data["devices"][0]
+
+
+def test_set_meta_disabled_returns_false(monkeypatch):
+    monkeypatch.setenv("NDM_DB", "off")
+    assert history.set_meta("aa:aa:aa:aa:aa:50", "x") is False

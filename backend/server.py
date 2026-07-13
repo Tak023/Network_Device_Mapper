@@ -33,8 +33,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from . import discovery, history
+from . import discovery, history, wol
 from .topology import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -68,8 +69,8 @@ if _cors_origins():
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_origins(),
-        allow_methods=["GET"],
-        allow_headers=["X-API-Token"],
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-API-Token", "Content-Type"],
     )
 
 
@@ -242,6 +243,44 @@ def api_scan_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+class MetaUpdate(BaseModel):
+    key: str                 # device identity: MAC when known, else IP
+    custom_name: str = ""
+    notes: str = ""
+
+
+@app.post("/api/device-meta")
+def api_device_meta(body: MetaUpdate, _auth: None = Depends(_require_token)) -> dict:
+    """Set (or clear, with empty strings) a user-supplied device name/notes."""
+    if not body.key.strip():
+        raise HTTPException(status_code=400, detail="Missing device key.")
+    if not history.set_meta(body.key, body.custom_name, body.notes):
+        raise HTTPException(
+            status_code=503,
+            detail="Device names need the history DB; it is disabled (NDM_DB=off).",
+        )
+    # Cached scan results embed the old label; drop them so the next fetch is right.
+    with _meta_lock:
+        _cache.clear()
+    return {"ok": True}
+
+
+class WolRequest(BaseModel):
+    mac: str
+
+
+@app.post("/api/wol")
+def api_wol(body: WolRequest, _auth: None = Depends(_require_token)) -> dict:
+    """Broadcast a Wake-on-LAN magic packet for the given MAC."""
+    try:
+        wol.wake(body.mac)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Send failed: {exc}") from exc
+    return {"ok": True}
 
 
 @app.get("/")
