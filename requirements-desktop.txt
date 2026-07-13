@@ -1,0 +1,4 @@
+# Standalone desktop app (native window, no browser).
+pywebview>=5
+# Only needed to build a distributable bundle (./build_app.sh):
+pyinstaller>=6.10
