@@ -19,7 +19,6 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("topology")
 
@@ -29,26 +28,29 @@ _dotenv_loaded = False
 @dataclass
 class TopoNode:
     mac: str
-    name: Optional[str]
-    ip: Optional[str]
+    name: str | None
+    ip: str | None
     role: str                       # gateway | switch | ap | client | router
-    uplink_mac: Optional[str]       # MAC of the parent (what this connects up to)
-    model: Optional[str] = None
-    port: Optional[str] = None      # parent's port this node hangs off, if known
+    uplink_mac: str | None       # MAC of the parent (what this connects up to)
+    model: str | None = None
+    port: str | None = None      # parent's port this node hangs off, if known
     is_infra: bool = False          # True for managed gear (gateway/switch/ap)
 
 
-def load_dotenv() -> None:
-    """Load KEY=VALUE pairs from the project-root .env into os.environ (once).
+def load_dotenv(env_path: Path | None = None) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ.
 
-    Lets the CLIs and the server work without run.sh. Existing environment variables
-    always win, so this never clobbers an explicit override.
+    With no argument, loads the project-root .env (once — repeat calls no-op).
+    An explicit `env_path` always loads; the desktop app uses this for .env files
+    next to the packaged binary. Existing environment variables always win, so
+    this never clobbers an explicit override.
     """
     global _dotenv_loaded
-    if _dotenv_loaded:
-        return
-    _dotenv_loaded = True
-    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if env_path is None:
+        if _dotenv_loaded:
+            return
+        _dotenv_loaded = True
+        env_path = Path(__file__).resolve().parent.parent / ".env"
     if not env_path.exists():
         return
     # Collect pairs first; on duplicate keys, a non-empty value wins (so a populated
@@ -67,9 +69,9 @@ def load_dotenv() -> None:
 
 
 def fetch_topology(
-    device_macs: Optional[dict[str, str]] = None,
-    gateway_ip: Optional[str] = None,
-) -> tuple[Optional[dict[str, TopoNode]], Optional[str]]:
+    device_macs: dict[str, str] | None = None,
+    gateway_ip: str | None = None,
+) -> tuple[dict[str, TopoNode] | None, str | None]:
     """Return (nodes, source) from the first configured provider, else (None, None).
 
     `device_macs` maps discovered IP -> MAC (from the scan); the SNMP provider uses it

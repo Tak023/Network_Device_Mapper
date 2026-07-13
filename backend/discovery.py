@@ -21,10 +21,14 @@ import re
 import socket
 import subprocess
 import sys
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger("discovery")
+
+# Optional progress callback: (phase, done, total). Phases: "sweep", "enrich",
+# "topology". `done`/`total` are None for phases without a meaningful count.
+ProgressFn = Callable[[str, int | None, int | None], None]
 
 # Per-host ping timeout (seconds) and sweep concurrency. 254 hosts / 128 workers
 # at a 1s timeout completes a /24 in a few seconds.
@@ -41,15 +45,15 @@ _MAC_RE = re.compile(r"(([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2})")
 @dataclass
 class Device:
     ip: str
-    mac: Optional[str] = None
-    hostname: Optional[str] = None
-    vendor: Optional[str] = None
+    mac: str | None = None
+    hostname: str | None = None
+    vendor: str | None = None
     is_gateway: bool = False
     is_self: bool = False
     # Physical topology (populated from UniFi when available).
-    uplink_mac: Optional[str] = None   # MAC of the device this connects up to
-    role: Optional[str] = None         # gateway | switch | ap | client
-    unifi_name: Optional[str] = None   # controller-assigned name (e.g. "Office Switch")
+    uplink_mac: str | None = None   # MAC of the device this connects up to
+    role: str | None = None         # gateway | switch | ap | client
+    unifi_name: str | None = None   # controller-assigned name (e.g. "Office Switch")
 
     @property
     def label(self) -> str:
@@ -65,18 +69,18 @@ class Device:
 
 @dataclass
 class ScanResult:
-    gateway_ip: Optional[str]
-    self_ip: Optional[str]
-    network_cidr: Optional[str]
+    gateway_ip: str | None
+    self_ip: str | None
+    network_cidr: str | None
     devices: list[Device] = field(default_factory=list)
     reachable: bool = True          # False == no route / network appears unreachable
-    note: Optional[str] = None      # human-readable status for the UI
+    note: str | None = None      # human-readable status for the UI
     topology_source: str = "l3-star"  # "unifi" when real L2 adjacency is available
 
     def to_dict(self) -> dict:
         d = asdict(self)
         # Attach the computed label so the frontend stays dumb.
-        for dev_dict, dev in zip(d["devices"], self.devices):
+        for dev_dict, dev in zip(d["devices"], self.devices, strict=True):
             dev_dict["label"] = dev.label
         return d
 
@@ -85,7 +89,7 @@ class ScanResult:
 # Network topology of *this* host
 # --------------------------------------------------------------------------- #
 
-def _primary_ip() -> Optional[str]:
+def _primary_ip() -> str | None:
     """Local IP of the interface used to reach the internet (no traffic sent)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -97,20 +101,29 @@ def _primary_ip() -> Optional[str]:
         s.close()
 
 
-def _enumerate_ipv4() -> list[tuple[str, ipaddress.IPv4Network]]:
-    """All (ip, network) IPv4 candidates from `ifconfig`, in interface order.
+def _run_first(*commands: list[str], timeout: int = 5) -> str | None:
+    """Run commands in order; return the first non-empty stdout, else None.
+
+    Lets us prefer the traditional tool but fall back where it's absent
+    (`ifconfig`/`arp` are net-tools, not installed on modern Linux distros).
+    """
+    for cmd in commands:
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out and out.strip():
+            return out
+    return None
+
+
+def _parse_ifconfig(out: str) -> list[tuple[str, ipaddress.IPv4Network]]:
+    """Parse `ifconfig` output into (ip, network) candidates.
 
     macOS reports the mask as hex (0xffffff00); Linux as a dotted quad. Both handled.
-    Point-to-point/overlay interfaces (Tailscale, WireGuard, VPNs) typically present a
-    /32 and are filtered out later by the LAN-selection logic.
     """
-    try:
-        out = subprocess.run(
-            ["ifconfig"], capture_output=True, text=True, timeout=5
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-
     candidates: list[tuple[str, ipaddress.IPv4Network]] = []
     for line in out.splitlines():
         line = line.strip()
@@ -132,6 +145,38 @@ def _enumerate_ipv4() -> list[tuple[str, ipaddress.IPv4Network]]:
     return candidates
 
 
+_IP_ADDR_RE = re.compile(r"\binet ([\d.]+)/(\d+)")
+
+
+def _parse_ip_addr(out: str) -> list[tuple[str, ipaddress.IPv4Network]]:
+    """Parse `ip -4 -o addr` output (`2: eth0    inet 192.168.1.5/24 brd ...`)."""
+    candidates: list[tuple[str, ipaddress.IPv4Network]] = []
+    for m in _IP_ADDR_RE.finditer(out):
+        try:
+            net = ipaddress.ip_network(f"{m.group(1)}/{m.group(2)}", strict=False)
+        except ValueError:
+            continue
+        candidates.append((m.group(1), net))
+    return candidates
+
+
+def _enumerate_ipv4() -> list[tuple[str, ipaddress.IPv4Network]]:
+    """All (ip, network) IPv4 candidates, in interface order.
+
+    Tries `ifconfig` (macOS/BSD, Linux with net-tools) then `ip -4 -o addr`
+    (iproute2, the default on modern Linux). Point-to-point/overlay interfaces
+    (Tailscale, WireGuard, VPNs) typically present a /32 and are filtered out
+    later by the LAN-selection logic.
+    """
+    out = _run_first(["ifconfig"])
+    if out:
+        parsed = _parse_ifconfig(out)
+        if parsed:
+            return parsed
+    out = _run_first(["ip", "-4", "-o", "addr"])
+    return _parse_ip_addr(out) if out else []
+
+
 # 100.64.0.0/10 is CGNAT space used by Tailscale and carrier-grade NAT -- not a LAN.
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
@@ -148,7 +193,7 @@ def _is_real_lan(ip: str, net: ipaddress.IPv4Network) -> bool:
     )
 
 
-def _default_gateway() -> Optional[str]:
+def _default_gateway() -> str | None:
     """Default gateway via `route` (macOS/BSD) or `ip route` (Linux)."""
     if sys.platform == "darwin":
         try:
@@ -175,7 +220,7 @@ def _default_gateway() -> Optional[str]:
     return None
 
 
-def _local_network() -> tuple[Optional[str], Optional[str], Optional[ipaddress.IPv4Network]]:
+def _local_network() -> tuple[str | None, str | None, ipaddress.IPv4Network | None]:
     """Return (self_ip, gateway_ip, network) for the real LAN to scan.
 
     Selection order:
@@ -221,7 +266,7 @@ def _local_network() -> tuple[Optional[str], Optional[str], Optional[ipaddress.I
 # Sweep + ARP
 # --------------------------------------------------------------------------- #
 
-def _ping(ip: str) -> Optional[str]:
+def _ping(ip: str) -> str | None:
     """Send one ICMP echo. Returns the ip on reply, else None."""
     # -c 1: one packet. macOS/BSD use -t for total timeout (s); Linux uses -W (s).
     timeout_flag = "-t" if sys.platform == "darwin" else "-W"
@@ -238,34 +283,47 @@ def _ping(ip: str) -> Optional[str]:
         return None
 
 
-def _ping_sweep(hosts: list[str]) -> set[str]:
+def _ping_sweep(hosts: list[str], progress: ProgressFn | None = None) -> set[str]:
     alive: set[str] = set()
+    total = len(hosts)
+    done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         for result in pool.map(_ping, hosts):
+            done += 1
             if result:
                 alive.add(result)
+            # Every ~5% is plenty for a UI; avoids thousands of callbacks on a /20.
+            if progress and (done % max(1, total // 20) == 0 or done == total):
+                progress("sweep", done, total)
     return alive
 
 
-def _arp_table() -> dict[str, str]:
-    """IP -> MAC from the system ARP cache via `arp -an`."""
-    mapping: dict[str, str] = {}
-    try:
-        out = subprocess.run(
-            ["arp", "-an"], capture_output=True, text=True, timeout=5
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return mapping
+def _parse_neighbors(out: str) -> dict[str, str]:
+    """IP -> MAC from neighbor-table output; handles both known formats:
 
-    # Lines look like: `? (192.168.1.1) at a4:5e:60:... on en0 ifscope [ethernet]`
+      arp -an:    `? (192.168.1.1) at a4:5e:60:... on en0 ifscope [ethernet]`
+      ip neigh:   `192.168.1.1 dev eth0 lladdr a4:5e:60:... REACHABLE`
+    """
+    mapping: dict[str, str] = {}
     for line in out.splitlines():
-        ip_match = re.search(r"\(([\d.]+)\)", line)
+        line = line.strip()
+        ip_match = re.search(r"\(([\d.]+)\)", line) or re.match(r"([\d.]+)\s", line)
         mac_match = _MAC_RE.search(line)
         if ip_match and mac_match:
             mac = _normalize_mac(mac_match.group(1))
             if mac != "00:00:00:00:00:00":  # incomplete entries
                 mapping[ip_match.group(1)] = mac
     return mapping
+
+
+def _arp_table() -> dict[str, str]:
+    """IP -> MAC from the system neighbor cache.
+
+    `arp -an` first (macOS/BSD, Linux net-tools), then `ip neigh show` (iproute2 —
+    the only one present on most modern Linux distros).
+    """
+    out = _run_first(["arp", "-an"], ["ip", "neigh", "show"])
+    return _parse_neighbors(out) if out else {}
 
 
 def _normalize_mac(mac: str) -> str:
@@ -277,12 +335,44 @@ def _normalize_mac(mac: str) -> str:
 # Enrichment (best-effort, never fatal)
 # --------------------------------------------------------------------------- #
 
-def _hostname(ip: str) -> Optional[str]:
+def _hostname(ip: str) -> str | None:
     try:
         name = socket.gethostbyaddr(ip)[0]
         return name.rstrip(".").removesuffix(".local")
     except (socket.herror, socket.gaierror, OSError):
         return None
+
+
+def _resolve_hostnames(
+    ips: list[str], progress: ProgressFn | None = None
+) -> dict[str, str]:
+    """Best-effort name resolution for many IPs: parallel reverse-DNS, then one
+    batched mDNS query for whatever DNS couldn't name.
+
+    Parallelism matters: `gethostbyaddr` on an IP with no PTR record blocks for the
+    full resolver timeout (often ~5s), so resolving 40 devices serially could add
+    minutes to a scan that swept the subnet in seconds.
+    """
+    names: dict[str, str] = {}
+    total = len(ips)
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+        for ip, name in zip(ips, pool.map(_hostname, ips), strict=True):
+            done += 1
+            if name:
+                names[ip] = name
+            if progress and (done % max(1, total // 10) == 0 or done == total):
+                progress("enrich", done, total)
+
+    # mDNS/Bonjour picks up Apple/IoT devices that never register PTR records.
+    unresolved = [ip for ip in ips if ip not in names]
+    if unresolved:
+        try:
+            from . import mdns
+            names.update(mdns.reverse_lookup(unresolved))
+        except Exception:  # best-effort, never fatal
+            logger.debug("mDNS lookup failed", exc_info=True)
+    return names
 
 
 def _vendor_lookup_factory():
@@ -296,7 +386,7 @@ def _vendor_lookup_factory():
         except Exception:  # pragma: no cover - cache may be absent on first run
             pass
 
-        def _lookup(mac: str) -> Optional[str]:
+        def _lookup(mac: str) -> str | None:
             try:
                 return lookup.lookup(mac)
             except Exception:
@@ -311,7 +401,7 @@ def _vendor_lookup_factory():
 # Public API
 # --------------------------------------------------------------------------- #
 
-def parse_target(spec: str) -> tuple[list[str], Optional[ipaddress.IPv4Network]]:
+def parse_target(spec: str) -> tuple[list[str], ipaddress.IPv4Network | None]:
     """Parse a user-supplied target into (host_ips, network).
 
     Accepts:
@@ -352,7 +442,7 @@ def parse_target(spec: str) -> tuple[list[str], Optional[ipaddress.IPv4Network]]
     return [str(h) for h in net.hosts()], net
 
 
-def _is_on_link(network: Optional[ipaddress.IPv4Network]) -> bool:
+def _is_on_link(network: ipaddress.IPv4Network | None) -> bool:
     """True if `network` overlaps a directly-connected interface subnet (same L2).
 
     A directly-connected target is reachable by definition; if it's *not* on-link and
@@ -421,11 +511,14 @@ def _apply_topology(devices: list[Device], result: ScanResult) -> None:
             result.gateway_ip = gw.ip
 
 
-def scan(target: Optional[str] = None) -> ScanResult:
+def scan(
+    target: str | None = None, progress: ProgressFn | None = None
+) -> ScanResult:
     """Discover devices on the local subnet, or on an explicit `target` range.
 
     `target` accepts any form understood by :func:`parse_target`. When omitted,
-    the primary LAN is auto-detected.
+    the primary LAN is auto-detected. `progress`, if given, is called with
+    (phase, done, total) as the scan advances — used by the server's SSE stream.
     """
     self_ip = _primary_ip()
 
@@ -447,7 +540,9 @@ def scan(target: Optional[str] = None) -> ScanResult:
         return result
 
     logger.info("Sweeping %d hosts (%s)", len(host_set), result.network_cidr)
-    alive = _ping_sweep(sorted(host_set, key=lambda x: ipaddress.ip_address(x)))
+    alive = _ping_sweep(
+        sorted(host_set, key=lambda x: ipaddress.ip_address(x)), progress
+    )
 
     arp = _arp_table()
     # Union of ping replies and ARP entries: some devices answer ARP but drop ICMP.
@@ -466,14 +561,17 @@ def scan(target: Optional[str] = None) -> ScanResult:
             result.gateway_ip = gateway
             logger.info("Gateway not on default route; inferred gateway %s", gateway)
 
+    ordered_ips = sorted(discovered_ips, key=lambda x: ipaddress.ip_address(x))
+    hostnames = _resolve_hostnames(ordered_ips, progress)
+
     vendor_of = _vendor_lookup_factory()
     devices: list[Device] = []
-    for ip in sorted(discovered_ips, key=lambda x: ipaddress.ip_address(x)):
+    for ip in ordered_ips:
         mac = arp.get(ip)
         dev = Device(
             ip=ip,
             mac=mac,
-            hostname=_hostname(ip),
+            hostname=hostnames.get(ip),
             vendor=vendor_of(mac) if mac else None,
             is_gateway=(ip == gateway),
             is_self=(ip == self_ip),
@@ -481,6 +579,8 @@ def scan(target: Optional[str] = None) -> ScanResult:
         devices.append(dev)
 
     # Enrich with real Layer-2 topology from a provider (SNMP/UniFi), if configured.
+    if progress:
+        progress("topology", None, None)
     _apply_topology(devices, result)
 
     result.devices = devices

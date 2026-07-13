@@ -1,7 +1,20 @@
 # Secrets — never commit real credentials
 .env
 
+# macOS
+.DS_Store
+
 # Python
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Scan history database (local data, per machine)
+scan_history.db

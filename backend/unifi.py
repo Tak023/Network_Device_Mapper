@@ -29,7 +29,6 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 from .topology import TopoNode, load_dotenv
 
@@ -47,12 +46,12 @@ class _Config:
     url: str
     site: str
     verify_tls: bool
-    api_key: Optional[str]
-    username: Optional[str]
-    password: Optional[str]
+    api_key: str | None
+    username: str | None
+    password: str | None
 
     @classmethod
-    def from_env(cls) -> "Optional[_Config]":
+    def from_env(cls) -> _Config | None:
         url = os.environ.get("UNIFI_URL", "").strip().rstrip("/")
         if not url:
             return None
@@ -71,11 +70,11 @@ class _Config:
         )
 
 
-def _norm_mac(mac: Optional[str]) -> Optional[str]:
+def _norm_mac(mac: str | None) -> str | None:
     return mac.lower() if mac else None
 
 
-def _role_from_features(d: dict) -> Optional[str]:
+def _role_from_features(d: dict) -> str | None:
     """Infer role from a device's `features`, which may be a dict or a list."""
     feats = d.get("features")
     keys = set()
@@ -121,7 +120,7 @@ class _OfficialApi:
             offset += count
         return out
 
-    def _site_id(self) -> Optional[str]:
+    def _site_id(self) -> str | None:
         sites = self._get("/sites")
         if not sites:
             return None
@@ -131,7 +130,7 @@ class _OfficialApi:
                 return s.get("id")
         return sites[0].get("id")  # single-site setups: just use the first
 
-    def fetch(self) -> Optional[dict[str, UnifiNode]]:
+    def fetch(self) -> dict[str, UnifiNode] | None:
         site_id = self._site_id()
         if not site_id:
             logger.warning("No UniFi site found via Integration API.")
@@ -227,7 +226,7 @@ class _LegacyApi:
         r.raise_for_status()
         return r.json().get("data", [])
 
-    def fetch(self) -> Optional[dict[str, UnifiNode]]:
+    def fetch(self) -> dict[str, UnifiNode] | None:
         if not self.login():
             return None
         nodes: dict[str, UnifiNode] = {}
@@ -261,7 +260,7 @@ class _LegacyApi:
 # Public API
 # --------------------------------------------------------------------------- #
 
-def fetch_topology() -> Optional[dict[str, UnifiNode]]:
+def fetch_topology() -> dict[str, UnifiNode] | None:
     """Return {mac: UnifiNode} of the controller's L2 adjacency, or None if unavailable.
 
     Prefers the official API key; falls back to local-admin credentials. None means
@@ -321,7 +320,7 @@ if __name__ == "__main__":
         print("No topology returned. Check UNIFI_URL / UNIFI_API_KEY and connectivity.")
         raise SystemExit(1)
     print(f"\n{len(topo)} nodes from UniFi:\n")
-    for mac, n in sorted(topo.items(), key=lambda kv: (kv[1].role, kv[1].name or "")):
+    for _mac, n in sorted(topo.items(), key=lambda kv: (kv[1].role, kv[1].name or "")):
         parent = topo.get(n.uplink_mac)
         parent_str = f"-> {parent.name or parent.mac}" if parent else "(root)"
         port = f" port {n.port}" if n.port else ""

@@ -4,9 +4,14 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Network Device Mapper</title>
+<link rel="icon" type="image/png" href="static/logo.png" />
 
-<!-- vis-network: zero-build force-directed graph, loaded from CDN -->
-<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<!-- vis-network: zero-build force-directed graph. Vendored locally so the tool works
+     on isolated/offline networks; CDN is only a fallback for decoupled hosting. -->
+<script src="static/vis-network.min.js"></script>
+<script>
+  window.vis || document.write('<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"><\/script>');
+</script>
 
 <style>
   :root {
@@ -29,9 +34,15 @@
   }
   header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 16px 24px; border-bottom: 1px solid var(--border);
+    padding: 14px 24px; border-bottom: 1px solid var(--border);
   }
-  header h1 { font-size: 18px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .brand .logo {
+    width: 44px; height: 44px; border-radius: 50%;
+    box-shadow: 0 0 18px rgba(124, 108, 246, .45);  /* soft glow matching the mark */
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 400; letter-spacing: .3px; }
+  header h1 strong { font-weight: 800; }
   header .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
   button {
     background: var(--accent); color: #082f49; border: 0; border-radius: 8px;
@@ -88,6 +99,28 @@
   }
   .badge.gw { background: var(--gateway); color: #422006; }
   .badge.self { background: var(--self); color: #064e3b; }
+  .badge.new { background: #f472b6; color: #500724; }
+
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  th .arrow { font-size: 9px; margin-left: 4px; }
+
+  #filterInput {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; width: 150px;
+    text-transform: none; letter-spacing: normal; font-weight: 400;
+  }
+  #filterInput::placeholder { color: var(--muted); }
+  #filterInput:focus { outline: none; border-color: var(--accent); }
+  .card h2 .tools { display: flex; align-items: center; gap: 8px; }
+
+  .missing {
+    padding: 10px 16px; border-top: 1px solid var(--border);
+    font-size: 12px; color: var(--muted);
+  }
+  .missing strong { color: var(--text); font-weight: 600; }
+  .missing li { margin: 3px 0; }
+  .missing ul { margin: 6px 0 0; padding-left: 18px; }
 
   .legend { display: flex; gap: 16px; padding: 6px 16px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
   .legend span::before { content: "●"; margin-right: 5px; }
@@ -106,9 +139,13 @@
 </head>
 <body>
   <header>
-    <div>
-      <h1>Network Device Mapper</h1>
-      <div class="meta" id="meta">Ready to scan.</div>
+    <div class="brand">
+      <img class="logo" src="static/logo.png" alt=""
+           onerror="this.style.display='none'" />
+      <div>
+        <h1><strong>Network</strong> Device Mapper</h1>
+        <div class="meta" id="meta">Ready to scan.</div>
+      </div>
     </div>
     <div class="controls">
       <input id="rangeInput" type="text" spellcheck="false"
@@ -132,34 +169,52 @@
     </div>
 
     <div class="card">
-      <h2>Devices <button id="exportCsvBtn" class="export-btn" disabled>⬇ CSV</button></h2>
+      <h2>Devices
+        <span class="tools">
+          <input id="filterInput" type="text" placeholder="Filter…" spellcheck="false" />
+          <button id="exportCsvBtn" class="export-btn" disabled>⬇ CSV</button>
+        </span>
+      </h2>
       <div id="tableWrap">
         <div class="status">Click “Scan network” to discover devices.</div>
       </div>
+      <div id="missingWrap"></div>
     </div>
   </div>
 
 <script>
   // Point this at your scanner API if the widget is hosted elsewhere.
   const API_BASE = "";
+  // If the server sets NDM_API_TOKEN, open the widget as /?token=YOURTOKEN and it's
+  // forwarded on every API call.
+  const API_TOKEN = new URLSearchParams(location.search).get("token") || "";
 
   const scanBtn = document.getElementById("scanBtn");
   const rangeBtn = document.getElementById("rangeBtn");
   const rangeInput = document.getElementById("rangeInput");
+  const filterInput = document.getElementById("filterInput");
   const meta = document.getElementById("meta");
   const tableWrap = document.getElementById("tableWrap");
+  const missingWrap = document.getElementById("missingWrap");
   const exportCsvBtn = document.getElementById("exportCsvBtn");
   const exportPngBtn = document.getElementById("exportPngBtn");
   let network = null;
   let lastData = null;   // most recent scan result, for exports
+  let sortKey = "ip";    // current table sort column
+  let sortAsc = true;
 
   scanBtn.addEventListener("click", () => runScan(null));
   rangeBtn.addEventListener("click", () => runScan(rangeInput.value.trim()));
   rangeInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") runScan(rangeInput.value.trim());
   });
+  filterInput.addEventListener("input", () => renderTable(currentDevices()));
   exportCsvBtn.addEventListener("click", exportCsv);
   exportPngBtn.addEventListener("click", exportPng);
+
+  function currentDevices() {
+    return (lastData && lastData.devices) || [];
+  }
 
   const topologyEl = document.getElementById("topology");
   let centering = false; // reentrancy guard: moveTo/fit must not recurse via events
@@ -203,15 +258,14 @@
     const what = target || "your local network";
     meta.textContent = `Sweeping ${what} — this can take a few seconds.`;
     tableWrap.innerHTML = '<div class="status">Scanning…</div>';
+    missingWrap.innerHTML = "";
     // Clear the previous network's graph immediately so stale nodes never linger.
     clearTopology(`Scanning ${escapeHtml(what)}…`);
     try {
       const qs = new URLSearchParams({ force: "true" });
       if (target) qs.set("target", target);
-      const res = await fetch(`${API_BASE}/api/scan?${qs}`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      render(data);
+      if (API_TOKEN) qs.set("token", API_TOKEN);
+      render(await scanWithProgress(qs));
     } catch (err) {
       meta.textContent = "Scan failed.";
       tableWrap.innerHTML = `<div class="status">⚠️ ${escapeHtml(err.message)}</div>`;
@@ -219,6 +273,50 @@
     } finally {
       setBusy(false);
     }
+  }
+
+  // Scan over SSE for live progress; falls back to the plain JSON endpoint when
+  // the stream can't be established (old browser, buffering proxy, or an HTTP
+  // error — the fallback fetch then surfaces the real error message).
+  function scanWithProgress(qs) {
+    return new Promise((resolve, reject) => {
+      if (!window.EventSource) return scanPlain(qs).then(resolve, reject);
+      const es = new EventSource(`${API_BASE}/api/scan/stream?${qs}`);
+      let settled = false;
+      es.onmessage = (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.event === "progress") {
+          showProgress(msg);
+        } else if (msg.event === "done") {
+          settled = true; es.close(); resolve(msg.result);
+        } else if (msg.event === "error") {
+          settled = true; es.close(); reject(new Error(msg.message));
+        }
+      };
+      es.onerror = () => {
+        es.close();
+        if (!settled) { settled = true; scanPlain(qs).then(resolve, reject); }
+      };
+    });
+  }
+
+  async function scanPlain(qs) {
+    const res = await fetch(`${API_BASE}/api/scan?${qs}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || data.detail || `HTTP ${res.status}`);
+    return data;
+  }
+
+  const PHASE_LABEL = {
+    sweep: (m) => `Sweeping — ${m.done}/${m.total} hosts pinged…`,
+    enrich: (m) => `Resolving device names — ${m.done}/${m.total}…`,
+    topology: () => "Querying switch topology (SNMP/UniFi)…",
+  };
+
+  function showProgress(msg) {
+    const fmt = PHASE_LABEL[msg.phase];
+    if (fmt) meta.textContent = fmt(msg);
   }
 
   // Destroy any existing graph and show a centered message in its place.
@@ -258,18 +356,62 @@
       : (data.note || `No devices found on ${data.network_cidr || "?"}.`);
     meta.textContent = summary;
     renderTable(devices);
+    renderMissing(data.missing_devices || []);
     renderTopology(data);
   }
 
+  // ---- Device table: filterable + sortable ----------------------------------
+
+  const COLUMNS = [
+    { key: "label",  title: "Device" },
+    { key: "ip",     title: "IP address" },
+    { key: "mac",    title: "MAC" },
+    { key: "vendor", title: "Vendor" },
+  ];
+
+  // Numeric IP sort; everything else case-insensitive text with blanks last.
+  function sortValue(d, key) {
+    if (key === "ip") {
+      return d.ip.split(".").reduce((n, o) => n * 256 + (+o), 0);
+    }
+    const v = d[key];
+    return v ? String(v).toLowerCase() : "￿";
+  }
+
+  function setSort(key) {
+    if (sortKey === key) sortAsc = !sortAsc;
+    else { sortKey = key; sortAsc = true; }
+    renderTable(currentDevices());
+  }
+
   function renderTable(devices) {
-    if (!devices.length) {
-      tableWrap.innerHTML = '<div class="status">No devices found.</div>';
+    const q = filterInput.value.trim().toLowerCase();
+    let shown = devices;
+    if (q) {
+      shown = devices.filter((d) =>
+        [d.label, d.ip, d.mac, d.vendor, d.role]
+          .some((v) => v && String(v).toLowerCase().includes(q)));
+    }
+    if (!shown.length) {
+      tableWrap.innerHTML = `<div class="status">${
+        devices.length ? "No devices match the filter." : "No devices found."}</div>`;
       return;
     }
-    const rows = devices.map((d) => {
+    shown = [...shown].sort((a, b) => {
+      const va = sortValue(a, sortKey), vb = sortValue(b, sortKey);
+      const cmp = va < vb ? -1 : va > vb ? 1 : 0;
+      return sortAsc ? cmp : -cmp;
+    });
+
+    const head = COLUMNS.map((c) => {
+      const arrow = c.key === sortKey ? `<span class="arrow">${sortAsc ? "▲" : "▼"}</span>` : "";
+      return `<th class="sortable" data-key="${c.key}">${c.title}${arrow}</th>`;
+    }).join("");
+    const rows = shown.map((d) => {
       const badges =
         (d.is_gateway ? '<span class="badge gw">GATEWAY</span>' : "") +
-        (d.is_self ? '<span class="badge self">THIS PC</span>' : "");
+        (d.is_self ? '<span class="badge self">THIS PC</span>' : "") +
+        (d.is_new && !d.is_self ? '<span class="badge new" title="First time seen on this network">NEW</span>' : "");
       return `<tr>
         <td>${escapeHtml(d.label)}${badges}</td>
         <td class="ip">${escapeHtml(d.ip)}</td>
@@ -278,8 +420,33 @@
       </tr>`;
     }).join("");
     tableWrap.innerHTML = `<table>
-      <thead><tr><th>Device</th><th>IP address</th><th>MAC</th><th>Vendor</th></tr></thead>
+      <thead><tr>${head}</tr></thead>
       <tbody>${rows}</tbody></table>`;
+    tableWrap.querySelectorAll("th.sortable").forEach((th) =>
+      th.addEventListener("click", () => setSort(th.dataset.key)));
+  }
+
+  // Devices seen on this network in past scans but absent from this one.
+  function renderMissing(missing) {
+    if (!missing.length) { missingWrap.innerHTML = ""; return; }
+    const items = missing.slice(0, 15).map((m) => {
+      const who = m.label || m.ip || m.mac;
+      const detail = [m.ip, m.mac].filter((v) => v && v !== who).join(" · ");
+      return `<li>${escapeHtml(who)}${detail ? ` <span>(${escapeHtml(detail)})</span>` : ""}
+        — last seen ${relTime(m.last_seen)}</li>`;
+    }).join("");
+    const more = missing.length > 15 ? `<li>…and ${missing.length - 15} more</li>` : "";
+    missingWrap.innerHTML = `<div class="missing">
+      <strong>${missing.length} device${missing.length > 1 ? "s" : ""} not seen this scan</strong>
+      <ul>${items}${more}</ul></div>`;
+  }
+
+  function relTime(ts) {
+    const s = Math.max(0, Date.now() / 1000 - ts);
+    if (s < 90) return "moments ago";
+    if (s < 5400) return `${Math.round(s / 60)} min ago`;
+    if (s < 129600) return `${Math.round(s / 3600)} h ago`;
+    return `${Math.round(s / 86400)} days ago`;
   }
 
   function renderTopology(data) {
@@ -433,10 +600,11 @@
     if (!devices.length) return;
     const labelByMac = {};
     devices.forEach((d) => { if (d.mac) labelByMac[d.mac.toLowerCase()] = d.label; });
-    const rows = [["Name", "IP", "MAC", "Vendor", "Role", "Connected To"]];
+    const rows = [["Name", "IP", "MAC", "Vendor", "Role", "Connected To", "First Seen"]];
     devices.forEach((d) => {
       const parent = d.uplink_mac ? (labelByMac[d.uplink_mac.toLowerCase()] || d.uplink_mac) : "";
-      rows.push([d.label, d.ip, d.mac, d.vendor, d.role, parent]);
+      const firstSeen = d.first_seen ? new Date(d.first_seen * 1000).toISOString() : "";
+      rows.push([d.label, d.ip, d.mac, d.vendor, d.role, parent, firstSeen]);
     });
     // BOM so Excel reads UTF-8; CRLF line endings per RFC 4180.
     const csv = "\uFEFF" + rows.map((r) => r.map(csvCell).join(",")).join("\r\n");

@@ -4,13 +4,18 @@ Scans your local network, discovers reachable devices (name + IP + MAC + vendor)
 and presents them as a **sortable table** and a **modern force-directed topology**
 you can embed in any website.
 
-![table + topology](docs/preview.png) <!-- optional: drop a screenshot here -->
+<!-- Drop a screenshot at docs/preview.png and uncomment:
+![table + topology](docs/preview.png) -->
 
 ## What it does
 
 - **Discovers** every reachable device on your primary subnet.
-- **Names** them via reverse-DNS and MAC-vendor lookup.
+- **Names** them via reverse-DNS, **mDNS/Bonjour** (Apple/IoT gear), and MAC-vendor lookup.
 - **Visualizes** them as a hub-and-spoke topology around your gateway/router.
+- **Remembers** past scans (SQLite) and flags devices that are **NEW** or have
+  **gone missing** since the last scan of that network.
+- **Streams progress** live while scanning (ping sweep counts, name resolution, SNMP).
+- **Sortable, filterable table** — click any column header; type to filter.
 - **Exports** the device list as **CSV** and the topology as a **PNG** (buttons in each
   card header; generated client-side from the current scan).
 - **Embeds** anywhere — the widget is a single static page that talks to a small API.
@@ -29,35 +34,69 @@ To run the discovery engine standalone (no web server):
 python3 -m backend.discovery
 ```
 
+## Desktop app (no browser)
+
+The same UI can run as a **standalone desktop app** — its own window and Dock
+icon, no browser, and nothing listening beyond loopback (the backend binds a
+random `127.0.0.1` port and exits with the window):
+
+```bash
+pip install -r requirements.txt -r requirements-desktop.txt
+python3 -m backend.desktop      # run from source
+./build_app.sh                  # or build a distributable bundle
+# macOS: dist/Network Device Mapper.app   Windows: dist/.../*.exe
+```
+
+Configuration: same env vars / `.env` as the server — put a `.env` next to the
+app bundle, in the working directory, or in the user data dir
+(`~/Library/Application Support/Network Device Mapper/` on macOS). Scan history
+is stored there too.
+
+**App icon:** `build_app.sh` generates the `.icns` automatically from
+`assets/icon.png` (1024×1024) — replace that file to rebrand. The in-app header
+logo (`frontend/logo.png`) is a center-crop of the same image.
+
+Note for distribution: the bundle is ad-hoc signed, so it runs on the build
+machine but other Macs will require right-click → Open (or notarization with an
+Apple Developer ID) the first time.
+
 ## How discovery works
 
 1. Determine this host's IP, subnet mask, and default gateway.
 2. Concurrent ICMP **ping-sweep** across the subnet to populate the ARP cache.
-3. Read the system **ARP table** (`arp -an`) for IP ↔ MAC.
-4. Best-effort **reverse-DNS** and **MAC-vendor** enrichment for names.
+3. Read the system **ARP table** (`arp -an`, or `ip neigh` on modern Linux) for IP ↔ MAC.
+4. Best-effort name enrichment, never fatal: parallel **reverse-DNS**, then one batched
+   **mDNS/Bonjour** query for whatever DNS couldn't name, plus **MAC-vendor** lookup.
 
 This runs **without root** and without raw sockets/scapy. Results are the union of
 ping replies and ARP entries, so devices that drop ICMP but answer ARP still appear.
+Works with either net-tools (`ifconfig`/`arp`) or iproute2 (`ip`) installed.
 
 ## Embedding in a website
 
 The widget (`frontend/index.html`) is plain HTML/JS with no build step.
+`vis-network` is vendored locally so everything works on offline/isolated networks.
 
 - **Simplest:** host this server and drop an iframe on your site:
   ```html
   <iframe src="http://YOUR_HOST:8000" width="100%" height="640" style="border:0"></iframe>
   ```
-- **Decoupled:** host `frontend/index.html` on your own site and set `API_BASE`
-  (top of the `<script>` block) to your scanner's URL. CORS is already open.
+- **Decoupled:** host `frontend/index.html` on your own site, set `API_BASE`
+  (top of the `<script>` block) to your scanner's URL, and set
+  `NDM_CORS_ORIGINS=https://your-site.example` on the server so the browser may
+  call it cross-origin (CORS is closed by default).
 
 ## Architecture
 
 ```
 backend/
-  discovery.py   # ping-sweep + ARP + rDNS/vendor enrichment  (pure Python, unprivileged)
-  server.py      # FastAPI: /api/scan (cached) + serves the widget, CORS-enabled
+  discovery.py   # ping-sweep + ARP + rDNS/mDNS/vendor enrichment  (pure Python, unprivileged)
+  mdns.py        # reverse mDNS (Bonjour) lookups, dependency-free
+  history.py     # SQLite scan history -> NEW / missing-device diffing
+  server.py      # FastAPI: /api/scan (+SSE stream), token/CORS/target guards, widget
 frontend/
   index.html     # table + vis-network topology, zero build step
+tests/           # parsers, correlation, history, API behavior (pytest)
 ```
 
 API:
@@ -67,8 +106,12 @@ API:
 | GET    | `/api/scan`                   | Scan the auto-detected local LAN (30s cache)  |
 | GET    | `/api/scan?target=<range>`    | Scan a specific range (see formats below)     |
 | GET    | `/api/scan?force=1`           | Bypass the cache                              |
+| GET    | `/api/scan/stream`            | Same scan as SSE with live progress events    |
 | GET    | `/api/health`                 | Liveness probe                               |
 | GET    | `/`                           | The embeddable widget                        |
+
+If `NDM_API_TOKEN` is set, `/api/scan*` require it (`X-API-Token` header or
+`?token=`; the widget forwards `/?token=...` from its own URL automatically).
 
 ### Scanning other networks
 
@@ -152,14 +195,30 @@ python3 -m backend.unifi --raw  # dump raw device/client JSON (field debugging)
 
 - **Only scan networks you own or are authorized to test.** Active scanning of
   third-party networks may be unlawful.
-- The API has **no authentication** and CORS is wide open — intended for trusted
-  LAN use. Put it behind auth / a reverse proxy before exposing it publicly.
+- **Safe defaults:** the server binds to `127.0.0.1` and CORS is closed, so neither
+  the LAN nor a random website your browser visits can reach the API.
+- To expose it (`HOST=0.0.0.0 ./run.sh`), set **`NDM_API_TOKEN`** so scans require
+  auth, and optionally **`NDM_ALLOWED_TARGETS`** to limit which ranges `?target=`
+  may sweep. See `.env.example`.
+
+## Development
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+ruff check backend tests   # lint
+pytest                     # parsers, SNMP correlation, history, API behavior
+RELOAD=1 ./run.sh          # auto-restart on code edits
+```
+
+CI (GitHub Actions) runs lint + tests on every push/PR.
 
 ## Roadmap
 
-- [ ] SNMP/LLDP collection for true switch-port topology
-- [ ] mDNS/Bonjour names for Apple/IoT devices
-- [ ] Persist scans over time + diff (new/missing device alerts)
+- [x] SNMP/LLDP collection for true switch-port topology
+- [x] mDNS/Bonjour names for Apple/IoT devices
+- [x] Persist scans over time + diff (new/missing device alerts)
+- [x] Export to PNG / CSV
 - [ ] Open-port / service fingerprinting (opt-in)
-- [ ] Export to PNG / CSV
+- [ ] SNMP v3 support
+- [ ] Scheduled background scans + notifications
 ```

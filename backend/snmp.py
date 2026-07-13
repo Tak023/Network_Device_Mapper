@@ -34,7 +34,6 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .topology import TopoNode
 
@@ -66,7 +65,7 @@ class _Config:
     timeout: int
 
     @classmethod
-    def from_env(cls) -> "Optional[_Config]":
+    def from_env(cls) -> _Config | None:
         community = os.environ.get("SNMP_COMMUNITY", "").strip()
         targets = [t.strip() for t in os.environ.get("SNMP_TARGETS", "").split(",") if t.strip()]
         if not community and not targets:
@@ -82,9 +81,9 @@ class _Config:
 @dataclass
 class _Switch:
     ip: str
-    mac: Optional[str]
-    name: Optional[str] = None
-    chassis_id: Optional[str] = None         # normalized MAC when chassis subtype is MAC
+    mac: str | None
+    name: str | None = None
+    chassis_id: str | None = None         # normalized MAC when chassis subtype is MAC
     neighbors: dict[str, dict] = field(default_factory=dict)  # localPort -> {chassis,sysname,port}
     fdb: dict[str, str] = field(default_factory=dict)         # device MAC -> bridgePort
     port_ifindex: dict[str, str] = field(default_factory=dict)  # bridgePort -> ifIndex
@@ -114,7 +113,7 @@ def _base_args(cfg: _Config, hexval: bool = False) -> list[str]:
     return ["-v", cfg.version, "-c", cfg.community, "-t", str(cfg.timeout), "-r", "1", fmt]
 
 
-def _run(cmd: list[str], timeout: int) -> Optional[str]:
+def _run(cmd: list[str], timeout: int) -> str | None:
     """Run an snmp* command, decoding bytes defensively (SNMP values carry raw binary
     that isn't valid UTF-8 — never let that crash us)."""
     try:
@@ -126,7 +125,7 @@ def _run(cmd: list[str], timeout: int) -> Optional[str]:
     return p.stdout.decode("utf-8", errors="replace")
 
 
-def _snmpget(cfg: _Config, host: str, oid: str, hexval: bool = False) -> Optional[str]:
+def _snmpget(cfg: _Config, host: str, oid: str, hexval: bool = False) -> str | None:
     out = _run(["snmpget", *_base_args(cfg, hexval), host, oid], cfg.timeout + 2)
     if not out or not out.strip():
         return None
@@ -159,7 +158,7 @@ def _value(raw: str) -> str:
     return raw.strip().strip('"')
 
 
-def _mac_from_value(value: str) -> Optional[str]:
+def _mac_from_value(value: str) -> str | None:
     """Extract a MAC from an SNMP octet-string value (hex pairs in any separator)."""
     import re
     hexes = re.findall(r"[0-9A-Fa-f]{2}", value)
@@ -168,7 +167,7 @@ def _mac_from_value(value: str) -> Optional[str]:
     return None
 
 
-def _mac_from_oid_octets(octets: list[str]) -> Optional[str]:
+def _mac_from_oid_octets(octets: list[str]) -> str | None:
     """The last 6 decimal components of an FDB OID index encode the MAC."""
     if len(octets) < 6:
         return None
@@ -178,7 +177,7 @@ def _mac_from_oid_octets(octets: list[str]) -> Optional[str]:
         return None
 
 
-def _cap_octet(cap_hex: Optional[str]) -> int:
+def _cap_octet(cap_hex: str | None) -> int:
     """LLDP sysCapEnabled bits, OR-ed across all octets (0 if absent/unparseable).
 
     The capability byte's position varies by vendor (some put it in the 2nd octet of
@@ -199,7 +198,7 @@ def _cap_octet(cap_hex: Optional[str]) -> int:
 # Per-switch collection
 # --------------------------------------------------------------------------- #
 
-def _collect(cfg: _Config, ip: str, mac: Optional[str]) -> Optional[_Switch]:
+def _collect(cfg: _Config, ip: str, mac: str | None) -> _Switch | None:
     """Probe one host; return a populated _Switch if it speaks SNMP, else None."""
     name = _snmpget(cfg, ip, OID["sysName"])
     if name is None:
@@ -245,7 +244,7 @@ def _collect(cfg: _Config, ip: str, mac: Optional[str]) -> Optional[_Switch]:
 # Correlation -> TopoNodes
 # --------------------------------------------------------------------------- #
 
-def _match_switch(neighbor: dict, switches: list[_Switch]) -> Optional[_Switch]:
+def _match_switch(neighbor: dict, switches: list[_Switch]) -> _Switch | None:
     """Resolve an LLDP neighbour to one of our polled devices (by chassis/sysname).
 
     Chassis-id and the management-interface MAC often differ (e.g. a UDM advertises a
@@ -259,7 +258,7 @@ def _match_switch(neighbor: dict, switches: list[_Switch]) -> Optional[_Switch]:
     return None
 
 
-def _build_nodes(switches: list[_Switch], gateway_ip: Optional[str]) -> dict[str, TopoNode]:
+def _build_nodes(switches: list[_Switch], gateway_ip: str | None) -> dict[str, TopoNode]:
     """Correlate FDB + LLDP across polled switches into a parent/child tree.
 
     Infra = the gateway, devices with a forwarding DB (real switches), and LLDP
@@ -376,9 +375,9 @@ def _build_nodes(switches: list[_Switch], gateway_ip: Optional[str]) -> dict[str
 
 def fetch_topology(
     device_macs: dict[str, str],
-    gateway_ip: Optional[str] = None,
-    targets: Optional[list[str]] = None,
-) -> Optional[dict[str, TopoNode]]:
+    gateway_ip: str | None = None,
+    targets: list[str] | None = None,
+) -> dict[str, TopoNode] | None:
     """Return {mac: TopoNode} from SNMP, or None if unavailable.
 
     `device_macs` maps discovered IP -> MAC. `targets` (explicit override) wins; else
@@ -414,6 +413,7 @@ def fetch_topology(
 
 if __name__ == "__main__":
     import sys
+
     from . import topology
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
