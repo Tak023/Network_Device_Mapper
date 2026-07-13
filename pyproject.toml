@@ -17,3 +17,4 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["."]  # make `backend` importable under bare `pytest` (e.g. CI)
