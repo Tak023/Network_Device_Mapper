@@ -26,6 +26,10 @@ Runs **two ways** (same features, same backend — pick either or both):
 - **Device-type icons** (📱 💻 📺 🎮 🖨️ …) inferred from vendor/hostname.
 - **Auto-rescan** — repeat the last scan every 1/5/15 minutes; NEW/missing
   update live.
+- **Background watch** — scheduled scans while the app runs, with **desktop
+  notifications** (and optional webhook) when a device joins or vanishes.
+- **Presence timeline & uptime** — per-device history strip and "seen in X of Y
+  scans" from the recorded scan log.
 - **Wake-on-LAN** — wake a sleeping device straight from its edit dialog.
 - **Streams progress** live while scanning (ping sweep counts, name resolution, SNMP).
 - **Sortable, filterable table** — click any column header; type to filter.
@@ -128,6 +132,9 @@ API:
 | GET    | `/api/scan/stream`            | Same scan as SSE with live progress events    |
 | POST   | `/api/device-meta`            | Set a custom name/notes: `{key, custom_name, notes}` (key = MAC or IP; empty strings clear) |
 | POST   | `/api/wol`                    | Send a Wake-on-LAN magic packet: `{mac}`      |
+| GET    | `/api/device-history`         | Per-scan presence + uptime: `?key&network&hours` |
+| GET    | `/api/scheduler`              | Background-watch config + last/next run       |
+| POST   | `/api/scheduler`              | Update watch config (partial, persisted)      |
 | GET    | `/api/health`                 | Liveness probe                               |
 | GET    | `/`                           | The embeddable widget                        |
 

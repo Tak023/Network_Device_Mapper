@@ -27,6 +27,7 @@ import secrets
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -35,7 +36,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import discovery, history, wol
+from . import discovery, history, scheduler, wol
 from .topology import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -53,7 +54,14 @@ FRONTEND_DIR = (
 CACHE_TTL_S = 30      # serve cached results within this window
 MAX_CACHE_ENTRIES = 32  # cap growth from many distinct ?target= values
 
-app = FastAPI(title="Network Device Mapper", version="1.1.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    scheduler.watch.start()  # idles unless the watch is enabled
+    yield
+    scheduler.watch.stop()
+
+
+app = FastAPI(title="Network Device Mapper", version="1.2.0", lifespan=_lifespan)
 
 
 def _cors_origins() -> list[str]:
@@ -265,6 +273,60 @@ def api_device_meta(body: MetaUpdate, _auth: None = Depends(_require_token)) -> 
     with _meta_lock:
         _cache.clear()
     return {"ok": True}
+
+
+@app.get("/api/device-history")
+def api_device_history(
+    key: str,
+    network: str,
+    hours: float = 168,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Per-scan presence + availability for one device (timeline/uptime)."""
+    result = history.device_history(network, key, min(max(hours, 1), 24 * 365))
+    if result is None:
+        raise HTTPException(status_code=503, detail="History DB is disabled (NDM_DB=off).")
+    return result
+
+
+class WatchUpdate(BaseModel):
+    enabled: bool | None = None
+    interval_min: int | None = None
+    target: str | None = None
+    notify_new: bool | None = None
+    notify_missing: bool | None = None
+    webhook_url: str | None = None
+
+
+@app.get("/api/scheduler")
+def api_scheduler_status(_auth: None = Depends(_require_token)) -> dict:
+    return scheduler.watch.status()
+
+
+@app.post("/api/scheduler")
+def api_scheduler_update(
+    body: WatchUpdate, _auth: None = Depends(_require_token)
+) -> dict:
+    """Update the background-watch config (partial; persisted in the DB)."""
+    if body.target is not None and body.target.strip():
+        try:
+            _validate_target(body.target.strip())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.interval_min is not None and body.interval_min < 1:
+        raise HTTPException(status_code=400, detail="interval_min must be >= 1.")
+
+    updates: dict[str, str] = {}
+    for field, value in body.model_dump(exclude_none=True).items():
+        updates[f"watch_{field}"] = (
+            ("true" if value else "false") if isinstance(value, bool) else str(value).strip()
+        )
+    if updates and not history.set_settings(updates):
+        raise HTTPException(
+            status_code=503,
+            detail="Watch settings need the history DB; it is disabled (NDM_DB=off).",
+        )
+    return scheduler.watch.status()
 
 
 class WolRequest(BaseModel):

@@ -1,5 +1,7 @@
 """Scan history: first_seen/is_new annotation and missing-device diffing."""
 
+import pytest
+
 from backend import history
 
 
@@ -97,3 +99,55 @@ def test_clearing_meta_restores_derived_label(tmp_path, monkeypatch):
 def test_set_meta_disabled_returns_false(monkeypatch):
     monkeypatch.setenv("NDM_DB", "off")
     assert history.set_meta("aa:aa:aa:aa:aa:50", "x") is False
+
+
+def test_settings_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    assert history.get_settings() == {}
+    assert history.set_settings({"watch_enabled": "true", "watch_interval_min": "5"})
+    assert history.get_settings() == {"watch_enabled": "true", "watch_interval_min": "5"}
+    history.set_settings({"watch_enabled": "false"})  # upsert
+    assert history.get_settings()["watch_enabled"] == "false"
+
+
+def test_device_history_availability(tmp_path, monkeypatch):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    dev = _dev("192.168.1.50", "aa:aa:aa:aa:aa:50")
+    history.annotate(_scan([dev, _dev("192.168.1.1", "aa:aa:aa:aa:aa:01")]))
+    history.annotate(_scan([_dev("192.168.1.1", "aa:aa:aa:aa:aa:01")]))  # .50 absent
+    history.annotate(_scan([dev, _dev("192.168.1.1", "aa:aa:aa:aa:aa:01")]))
+
+    h = history.device_history("192.168.1.0/24", "AA:AA:AA:AA:AA:50")
+    assert [p["seen"] for p in h["points"]] == [True, False, True]
+    assert h["availability"] == pytest.approx(2 / 3)
+
+    always = history.device_history("192.168.1.0/24", "aa:aa:aa:aa:aa:01")
+    assert always["availability"] == 1.0
+
+
+def test_device_history_disabled(monkeypatch):
+    monkeypatch.setenv("NDM_DB", "off")
+    assert history.device_history("x", "y") is None
+
+
+def test_presence_log_pruned(tmp_path, monkeypatch):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    monkeypatch.setenv("NDM_HISTORY_DAYS", "7")
+    db = tmp_path / "h.db"
+
+    # Seed a scan/sighting 30 days old, directly in the DB.
+    import sqlite3
+    import time
+    old = time.time() - 30 * 86400
+    with history._connect(db) as conn:
+        conn.execute("INSERT INTO scans (network, ts) VALUES (?, ?)", ("192.168.1.0/24", old))
+        conn.execute("INSERT INTO sightings (network, key, ts) VALUES (?, ?, ?)",
+                     ("192.168.1.0/24", "aa:aa:aa:aa:aa:01", old))
+
+    # A fresh scan triggers pruning of anything older than the retention window.
+    history.annotate(_scan([_dev("192.168.1.1", "aa:aa:aa:aa:aa:01")]))
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM scans WHERE ts = ?", (old,)).fetchone()[0] == 0
+    # Only the fresh point remains.
+    h = history.device_history("192.168.1.0/24", "aa:aa:aa:aa:aa:01")
+    assert len(h["points"]) == 1 and h["points"][0]["seen"] is True

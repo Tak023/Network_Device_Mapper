@@ -164,6 +164,24 @@
   .modal-actions { display: flex; gap: 8px; margin-top: 16px; align-items: center; }
   .modal-actions .spacer { flex: 1; }
   .modal-status { margin-top: 10px; font-size: 12px; color: var(--muted); min-height: 16px; }
+  .modal select {
+    width: 100%; box-sizing: border-box; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 14px;
+  }
+  .modal label.check {
+    display: flex; align-items: center; gap: 8px; color: var(--text);
+    font-size: 13px; margin: 12px 0 0; cursor: pointer;
+  }
+  .modal input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+
+  #watchBtn.active { border-color: var(--accent); color: var(--accent); }
+
+  /* Presence timeline in the device modal */
+  .uptime { font-size: 12px; color: var(--muted); margin: 2px 0 6px; }
+  .strip { display: flex; gap: 2px; margin-bottom: 8px; }
+  .strip span { flex: 1; max-width: 8px; height: 12px; border-radius: 2px; background: var(--panel-2); }
+  .strip span.on { background: var(--self); }
+  .strip span.off { background: #b45309; }
 
   .legend { display: flex; gap: 16px; padding: 6px 16px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
   .legend span::before { content: "●"; margin-right: 5px; }
@@ -201,14 +219,47 @@
         <option value="300">Auto: 5 min</option>
         <option value="900">Auto: 15 min</option>
       </select>
+      <button id="watchBtn" class="secondary"
+              title="Background watch: scheduled scans + notifications">⏱ Watch</button>
     </div>
   </header>
+
+  <!-- Background watch settings -->
+  <div id="watchOverlay" class="overlay hidden">
+    <div class="modal">
+      <h3>⏱ Background watch</h3>
+      <div class="device-info">Scans on a schedule while the app is running and
+        notifies you when devices join (or vanish from) the network.</div>
+      <label class="check"><input type="checkbox" id="watchEnabled" /> Enable background watch</label>
+      <label for="watchInterval">Scan every</label>
+      <select id="watchInterval">
+        <option value="5">5 minutes</option>
+        <option value="15">15 minutes</option>
+        <option value="30">30 minutes</option>
+        <option value="60">60 minutes</option>
+      </select>
+      <label for="watchTarget">Target (blank = my network)</label>
+      <input id="watchTarget" type="text" spellcheck="false" placeholder="e.g. 192.168.1.0/24" />
+      <label class="check"><input type="checkbox" id="watchNotifyNew" /> Notify when a new device joins</label>
+      <label class="check"><input type="checkbox" id="watchNotifyMissing" /> Notify when a device goes missing</label>
+      <label for="watchWebhook">Webhook URL (optional)</label>
+      <input id="watchWebhook" type="text" spellcheck="false"
+             placeholder="https://…  (receives JSON {title, message})" />
+      <div class="modal-actions">
+        <button id="watchCancel" class="secondary">Cancel</button>
+        <span class="spacer"></span>
+        <button id="watchSave">Save</button>
+      </div>
+      <div class="modal-status" id="watchStatus"></div>
+    </div>
+  </div>
 
   <!-- Device edit modal: custom name, notes, Wake-on-LAN -->
   <div id="modalOverlay" class="overlay hidden">
     <div class="modal">
       <h3 id="modalTitle">Edit device</h3>
       <div class="device-info" id="modalInfo"></div>
+      <div id="modalHistory"></div>
       <label for="modalName">Name</label>
       <input id="modalName" type="text" placeholder="e.g. Living Room TV" maxlength="64" />
       <label for="modalNotes">Notes</label>
@@ -603,6 +654,33 @@
                             : "No MAC known for this device";
     modalOverlay.classList.remove("hidden");
     modalName.focus();
+    loadDeviceHistory(d);
+  }
+
+  // Presence timeline: one tick per scan over the last 7 days, plus uptime %.
+  const modalHistory = document.getElementById("modalHistory");
+
+  async function loadDeviceHistory(d) {
+    modalHistory.innerHTML = "";
+    if (!lastData || !lastData.network_cidr) return;
+    try {
+      const qs = new URLSearchParams({
+        key: deviceKey(d), network: lastData.network_cidr, hours: "168",
+      });
+      const res = await fetch(`${API_BASE}/api/device-history?${qs}`, { headers: apiHeaders() });
+      if (!res.ok) return;
+      const h = await res.json();
+      if (modalDevice !== d || !h.points || h.points.length < 2) return;
+      const seen = h.points.filter((p) => p.seen).length;
+      const pct = Math.round(h.availability * 100);
+      const ticks = h.points.slice(-96).map((p) =>
+        `<span class="${p.seen ? "on" : "off"}"
+               title="${new Date(p.ts * 1000).toLocaleString()} — ${p.seen ? "seen" : "missed"}"></span>`
+      ).join("");
+      modalHistory.innerHTML =
+        `<div class="uptime">Seen in ${seen} of ${h.points.length} scans (${pct}%) · last 7 days</div>
+         <div class="strip">${ticks}</div>`;
+    } catch { /* history is a bonus; never block the modal */ }
   }
 
   function closeModal() {
@@ -615,7 +693,9 @@
     if (e.target === modalOverlay) closeModal();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && modalDevice) closeModal();
+    if (e.key !== "Escape") return;
+    if (modalDevice) closeModal();
+    if (watchOpen) closeWatch();
   });
 
   document.getElementById("modalSave").addEventListener("click", async () => {
@@ -658,6 +738,93 @@
       modalStatus.textContent = "⚡ Magic packet sent. The device may take ~30s to wake.";
     } catch (err) {
       modalStatus.textContent = `⚠️ ${err.message}`;
+    }
+  });
+
+  // ---- Background watch settings ---------------------------------------------
+
+  const watchBtn = document.getElementById("watchBtn");
+  const watchOverlay = document.getElementById("watchOverlay");
+  const watchEnabled = document.getElementById("watchEnabled");
+  const watchInterval = document.getElementById("watchInterval");
+  const watchTarget = document.getElementById("watchTarget");
+  const watchNotifyNew = document.getElementById("watchNotifyNew");
+  const watchNotifyMissing = document.getElementById("watchNotifyMissing");
+  const watchWebhook = document.getElementById("watchWebhook");
+  const watchStatus = document.getElementById("watchStatus");
+  let watchOpen = false;
+
+  async function fetchWatch() {
+    try {
+      const res = await fetch(`${API_BASE}/api/scheduler`, { headers: apiHeaders() });
+      return res.ok ? await res.json() : null;
+    } catch { return null; }
+  }
+
+  function updateWatchBtn(st) {
+    if (st && st.enabled) {
+      watchBtn.textContent = `⏱ Watch: ${st.interval_min}m`;
+      watchBtn.classList.add("active");
+    } else {
+      watchBtn.textContent = "⏱ Watch";
+      watchBtn.classList.remove("active");
+    }
+  }
+  fetchWatch().then(updateWatchBtn);
+
+  watchBtn.addEventListener("click", async () => {
+    const st = await fetchWatch();
+    if (!st) {
+      meta.textContent = "Watch unavailable — is the history DB disabled (NDM_DB=off)?";
+      return;
+    }
+    watchEnabled.checked = st.enabled;
+    // Select the configured interval, adding a custom option if needed (env-set).
+    if (![...watchInterval.options].some((o) => +o.value === st.interval_min)) {
+      watchInterval.add(new Option(`${st.interval_min} minutes`, st.interval_min));
+    }
+    watchInterval.value = String(st.interval_min);
+    watchTarget.value = st.target || "";
+    watchNotifyNew.checked = st.notify_new;
+    watchNotifyMissing.checked = st.notify_missing;
+    watchWebhook.value = st.webhook_url || "";
+    watchStatus.textContent = st.last_run
+      ? `Last run ${relTime(st.last_run)} — ${st.last_summary || ""}`
+      : "Hasn't run yet.";
+    watchOpen = true;
+    watchOverlay.classList.remove("hidden");
+  });
+
+  function closeWatch() {
+    watchOverlay.classList.add("hidden");
+    watchOpen = false;
+  }
+  document.getElementById("watchCancel").addEventListener("click", closeWatch);
+  watchOverlay.addEventListener("click", (e) => {
+    if (e.target === watchOverlay) closeWatch();
+  });
+
+  document.getElementById("watchSave").addEventListener("click", async () => {
+    watchStatus.textContent = "Saving…";
+    try {
+      const res = await fetch(`${API_BASE}/api/scheduler`, {
+        method: "POST",
+        headers: apiHeaders(),
+        body: JSON.stringify({
+          enabled: watchEnabled.checked,
+          interval_min: parseInt(watchInterval.value, 10),
+          target: watchTarget.value.trim(),
+          notify_new: watchNotifyNew.checked,
+          notify_missing: watchNotifyMissing.checked,
+          webhook_url: watchWebhook.value.trim(),
+        }),
+      });
+      const st = await res.json();
+      if (!res.ok) throw new Error(st.detail || `HTTP ${res.status}`);
+      updateWatchBtn(st);
+      closeWatch();
+    } catch (err) {
+      watchStatus.textContent = `⚠️ ${err.message}`;
     }
   });
 

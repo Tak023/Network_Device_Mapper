@@ -159,3 +159,38 @@ def test_post_endpoints_require_token_when_set(client, monkeypatch):
     monkeypatch.setenv("NDM_API_TOKEN", "sekrit")
     assert client.post("/api/wol", json={"mac": "a4:5e:60:aa:bb:cc"}).status_code == 401
     assert client.post("/api/device-meta", json={"key": "x"}).status_code == 401
+    assert client.post("/api/scheduler", json={"enabled": True}).status_code == 401
+
+
+def test_scheduler_get_and_update(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    for env in ("NDM_WATCH_ENABLED", "NDM_WATCH_INTERVAL_MIN"):
+        monkeypatch.delenv(env, raising=False)
+    assert client.get("/api/scheduler").json()["enabled"] is False
+
+    r = client.post("/api/scheduler", json={"enabled": True, "interval_min": 5})
+    st = r.json()
+    assert r.status_code == 200 and st["enabled"] is True and st["interval_min"] == 5
+    # Persisted across a fresh status read.
+    assert client.get("/api/scheduler").json()["interval_min"] == 5
+
+
+def test_scheduler_rejects_bad_input(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    assert client.post("/api/scheduler", json={"interval_min": 0}).status_code == 400
+    assert client.post("/api/scheduler", json={"target": "10.0.0.0/8"}).status_code == 400
+
+
+def test_device_history_endpoint(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("NDM_DB", str(tmp_path / "h.db"))
+    from backend import history
+    history.annotate({"network_cidr": "10.0.0.0/24",
+                      "devices": [{"ip": "10.0.0.5", "mac": "aa:aa:aa:aa:aa:50", "label": "x"}]})
+    r = client.get("/api/device-history?key=aa:aa:aa:aa:aa:50&network=10.0.0.0/24")
+    assert r.status_code == 200
+    assert r.json()["availability"] == 1.0
+
+
+def test_device_history_503_when_disabled(client):
+    r = client.get("/api/device-history?key=x&network=y")
+    assert r.status_code == 503

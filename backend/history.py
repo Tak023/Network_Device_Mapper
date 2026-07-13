@@ -43,7 +43,27 @@ CREATE TABLE IF NOT EXISTS device_meta (
     custom_name TEXT,
     notes       TEXT
 );
+-- Per-scan presence log (powers the timeline + uptime stats). Pruned after
+-- NDM_HISTORY_DAYS (default 30).
+CREATE TABLE IF NOT EXISTS scans (
+    network TEXT NOT NULL,
+    ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scans ON scans (network, ts);
+CREATE TABLE IF NOT EXISTS sightings (
+    network TEXT NOT NULL,
+    key     TEXT NOT NULL,
+    ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sightings ON sightings (network, key, ts);
+-- Small key/value store for runtime-editable settings (background watch).
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+HISTORY_DAYS_DEFAULT = 30
 
 
 def _db_path() -> Path | None:
@@ -100,6 +120,76 @@ def _meta_map(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
             "SELECT key, custom_name, notes FROM device_meta"
         )
     }
+
+
+def get_settings() -> dict[str, str]:
+    """All persisted settings; {} when persistence is disabled/broken."""
+    path = _db_path()
+    if path is None:
+        return {}
+    try:
+        with _connect(path) as conn:
+            return dict(conn.execute("SELECT key, value FROM settings"))
+    except sqlite3.Error:
+        return {}
+
+
+def set_settings(values: dict[str, str]) -> bool:
+    """Persist settings key/values. Returns False if persistence is disabled."""
+    path = _db_path()
+    if path is None or not values:
+        return False
+    try:
+        with _connect(path) as conn:
+            conn.executemany(
+                """INSERT INTO settings (key, value) VALUES (?, ?)
+                   ON CONFLICT (key) DO UPDATE SET value = excluded.value""",
+                [(k, str(v)) for k, v in values.items()],
+            )
+        return True
+    except sqlite3.Error as exc:
+        logger.warning("Could not save settings (%s)", exc)
+        return False
+
+
+def device_history(network: str, key: str, hours: float = 168) -> dict | None:
+    """Per-scan presence for one device: which scans it appeared in.
+
+    Returns {"points": [{"ts", "seen"}...], "availability": 0..1 | None},
+    or None when persistence is disabled.
+    """
+    path = _db_path()
+    if path is None:
+        return None
+    since = time.time() - hours * 3600
+    try:
+        with _connect(path) as conn:
+            scan_ts = [
+                ts for (ts,) in conn.execute(
+                    "SELECT ts FROM scans WHERE network = ? AND ts >= ? ORDER BY ts",
+                    (network, since),
+                )
+            ]
+            seen = {
+                ts for (ts,) in conn.execute(
+                    "SELECT ts FROM sightings WHERE network = ? AND key = ? AND ts >= ?",
+                    (network, key.lower(), since),
+                )
+            }
+    except sqlite3.Error:
+        return None
+    points = [{"ts": ts, "seen": ts in seen} for ts in scan_ts]
+    availability = (
+        sum(1 for p in points if p["seen"]) / len(points) if points else None
+    )
+    return {"points": points, "availability": availability}
+
+
+def _history_days() -> float:
+    try:
+        return float(os.environ.get("NDM_HISTORY_DAYS", "") or HISTORY_DAYS_DEFAULT)
+    except ValueError:
+        return HISTORY_DAYS_DEFAULT
 
 
 def annotate(data: dict) -> None:
@@ -164,5 +254,15 @@ def annotate(data: dict) -> None:
             ]
             missing.sort(key=lambda m: m["last_seen"], reverse=True)
             data["missing_devices"] = missing
+
+            # Presence log for the timeline/uptime views, with rolling pruning.
+            conn.execute("INSERT INTO scans (network, ts) VALUES (?, ?)", (network, now))
+            conn.executemany(
+                "INSERT INTO sightings (network, key, ts) VALUES (?, ?, ?)",
+                [(network, key, now) for key in present],
+            )
+            cutoff = now - _history_days() * 86400
+            conn.execute("DELETE FROM scans WHERE ts < ?", (cutoff,))
+            conn.execute("DELETE FROM sightings WHERE ts < ?", (cutoff,))
     except sqlite3.Error as exc:
         logger.warning("Scan history unavailable (%s); continuing without it.", exc)
