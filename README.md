@@ -1,8 +1,14 @@
 # Network Device Mapper
 
 Scans your local network, discovers reachable devices (name + IP + MAC + vendor),
-and presents them as a **sortable table** and a **modern force-directed topology**
-you can embed in any website.
+and presents them as a **sortable table** and a **modern force-directed topology**.
+
+Runs **two ways** (same features, same backend — pick either or both):
+
+|  | How | Best for |
+|---|---|---|
+| 🖥️ **Desktop app** | `./build_app.sh` → double-click the app | Everyday use — native window, Dock icon, nothing listening beyond loopback |
+| 🌐 **Browser / server** | `./run.sh` → `http://127.0.0.1:8000` | Embedding in a website, running on a headless box (NAS/Pi), sharing on the LAN |
 
 <!-- Drop a screenshot at docs/preview.png and uncomment:
 ![table + topology](docs/preview.png) -->
@@ -22,30 +28,36 @@ you can embed in any website.
 
 ## Quick start
 
+**Desktop app** (native window, no browser):
+
+```bash
+pip install -r requirements.txt -r requirements-desktop.txt
+./build_app.sh                  # build once -> dist/Network Device Mapper.app
+# or run it straight from source:
+python3 -m backend.desktop
+```
+
+**Browser / server mode** (for embedding, headless boxes, or LAN access):
+
 ```bash
 ./run.sh
 # then open http://127.0.0.1:8000  and click “Scan network”
 ```
 
 `run.sh` creates a virtualenv, installs dependencies, and starts the server.
-To run the discovery engine standalone (no web server):
+Both modes are maintained — the desktop app is simply the same server plus the
+same UI wrapped in a native window on a private random port.
+
+To run the discovery engine standalone (no UI at all):
 
 ```bash
 python3 -m backend.discovery
 ```
 
-## Desktop app (no browser)
+## Desktop app details
 
-The same UI can run as a **standalone desktop app** — its own window and Dock
-icon, no browser, and nothing listening beyond loopback (the backend binds a
-random `127.0.0.1` port and exits with the window):
-
-```bash
-pip install -r requirements.txt -r requirements-desktop.txt
-python3 -m backend.desktop      # run from source
-./build_app.sh                  # or build a distributable bundle
-# macOS: dist/Network Device Mapper.app   Windows: dist/.../*.exe
-```
+The backend binds a random `127.0.0.1` port and exits with the window — nothing
+is ever reachable from the network.
 
 Configuration: same env vars / `.env` as the server — put a `.env` next to the
 app bundle, in the working directory, or in the user data dir
