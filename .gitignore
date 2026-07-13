@@ -15,6 +15,7 @@ __pycache__/
 build/
 dist/
 *.spec
+assets/icon.icns  # generated from assets/icon.png by build_app.sh
 
 # Scan history database (local data, per machine)
 scan_history.db
