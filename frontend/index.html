@@ -341,21 +341,37 @@
   let centering = false; // reentrancy guard: moveTo/fit must not recurse via events
 
   // Place the midpoint of all nodes at the viewport center. When keepScale is true we
-  // preserve the user's current zoom (used while zooming); otherwise we frame-to-fit.
+  // preserve the user's current zoom (used while zooming); otherwise we compute the
+  // largest scale that still shows every node *and its label* — vis's own fit()
+  // ignores label width and the container aspect ratio, so it leaves big margins.
   function centerGraph(keepScale) {
     if (!network || centering) return;
     centering = true;
     try {
+      // Make sure the canvas matches the container before measuring.
+      network.setSize(topologyEl.clientWidth + "px", topologyEl.clientHeight + "px");
       const pts = Object.values(network.getPositions());
       if (!pts.length) return;
       const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
-      const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-      const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+
       if (keepScale) {
         network.moveTo({ position: { x: cx, y: cy }, scale: network.getScale(), animation: false });
-      } else {
-        network.fit({ animation: false });
+        return;
       }
+
+      const w = topologyEl.clientWidth, h = topologyEl.clientHeight;
+      if (!w || !h) return;
+      // Pad the node cloud for the node radius + labels (which extend well past the
+      // node centers, especially the long "Vendor device" strings) so nothing clips.
+      const padX = 170, padY = 70;
+      const contentW = (maxX - minX) + padX * 2;
+      const contentH = (maxY - minY) + padY * 2;
+      // Cap the zoom so a tiny graph (1–2 nodes) doesn't blow up comically large.
+      const scale = Math.min(w / contentW, h / contentH, 1.6);
+      network.moveTo({ position: { x: cx, y: cy }, scale, animation: false });
     } finally {
       centering = false;
     }
@@ -988,7 +1004,28 @@
     return cidr ? "-" + cidr.replace(/[^\w.-]/g, "_") : "";
   }
 
-  function downloadBlob(blob, filename) {
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result).split(",", 2)[1]);
+      r.onerror = reject;
+      r.readAsDataURL(blob);
+    });
+  }
+
+  async function downloadBlob(blob, filename) {
+    // Desktop app (pywebview): the <a download> trick just navigates the webview
+    // to the blob, so hand the bytes to the native Save dialog instead.
+    if (window.pywebview?.api?.save_file) {
+      try {
+        const res = await window.pywebview.api.save_file(filename, await blobToBase64(blob));
+        if (res && res.ok === false && res.error) {
+          meta.textContent = `⚠️ Save failed: ${res.error}`;
+        }
+        return;
+      } catch (_e) { /* bridge hiccup -> fall back to the browser method */ }
+    }
+    // Browser mode: standard anchor download.
     const url = URL.createObjectURL(blob);
     const a = Object.assign(document.createElement("a"), { href: url, download: filename });
     document.body.appendChild(a);

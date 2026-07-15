@@ -124,6 +124,42 @@ def wait_healthy(port: int, timeout: float = 15.0) -> bool:
     return False
 
 
+class _JsApi:
+    """Bridge exposed to the page as ``window.pywebview.api``.
+
+    WKWebView/WebView2 ignore the HTML ``<a download>`` attribute — clicking such
+    a link navigates the webview to the blob URL instead of saving a file. So the
+    page hands export bytes here and we drive a real native Save dialog.
+    """
+
+    def __init__(self) -> None:
+        self.window = None  # set after the window is created
+
+    def save_file(self, filename: str, content_b64: str) -> dict:
+        import base64
+
+        if self.window is None:
+            return {"ok": False, "error": "window not ready"}
+        try:
+            import webview
+
+            result = self.window.create_file_dialog(
+                webview.SAVE_DIALOG, save_filename=filename
+            )
+        except Exception as exc:  # dialog unavailable -> report, page can retry
+            return {"ok": False, "error": str(exc)}
+        if not result:
+            return {"ok": False, "cancelled": True}
+        path = result[0] if isinstance(result, (list, tuple)) else result
+        try:
+            with open(path, "wb") as fh:
+                fh.write(base64.b64decode(content_b64))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        logger.info("Saved export to %s", path)
+        return {"ok": True, "path": str(path)}
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -144,12 +180,14 @@ def main() -> None:
 
     import webview  # imported late: not needed for tests / server-only use
 
-    webview.create_window(
+    api = _JsApi()
+    api.window = webview.create_window(
         APP_NAME,
         f"http://127.0.0.1:{port}/",
         width=1280,
         height=860,
         min_size=(900, 600),
+        js_api=api,  # exposes save_file as window.pywebview.api.save_file
     )
     webview.start()  # blocks until the window closes; daemon threads then exit
 
